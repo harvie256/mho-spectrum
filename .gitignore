@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+# Frame-timing dumps and screenshots from --timing-csv / --screenshot
+*.csv
+*.png
+!docs/**/*.png

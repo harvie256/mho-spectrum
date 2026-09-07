@@ -1,0 +1,10 @@
+# The spectrum app itself:
+numpy
+scipy
+pyqtgraph
+PyQt5
+
+# device/tap_stream.py (injecting the on-scope tap):
+frida>=17
+
+# device/rigol_mho.py (SCPI): standard library only, nothing to install.

@@ -1,0 +1,103 @@
+# mho-spectrum
+
+A spectrum analyser for the PC, fed by a Rigol MHO934 oscilloscope.
+
+The scope captures; this does the maths and owns the display. Records arrive
+either over SCPI or — much faster — through an in-app *tap* injected into the
+scope's own process, which hands over the sample buffer the app already holds
+and skips the SCPI reply path entirely. On a 1 Mpt record that is ~14 fps.
+
+This started life as `fftdemo/` in the
+[mho-speed-patch](../rigol) repo and outgrew it. That repo still owns the speed
+patch itself and the reverse-engineering behind it; see
+[Relationship to mho-speed-patch](#relationship-to-mho-speed-patch).
+
+## Quick start
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+./run_fft.sh                       # synthetic signal, no scope needed
+./run_fft.sh tap 172.30.188.217    # live off the scope, fastest path
+./run_fft.sh scpi 192.168.23.20    # live over plain SCPI, slower
+./run_fft.sh stream                # listen for a tap started elsewhere
+./run_fft.sh --help
+```
+
+`--headless` runs without a window; `--run-seconds N --screenshot out.png`
+captures a frame and exits, which is how the smoke tests work.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `run_fft.sh` | launcher — picks a source, runs the app out of `.venv` |
+| `spectrum/fft_gui.py` | the application: pyqtgraph display, controls, CLI |
+| `spectrum/spectrum.py` | `SpectrumEngine` — windowing, FFT, averaging, dB, display reduction |
+| `spectrum/sources.py` | interchangeable frame sources: `synthetic`, `scpi`, `stream`/`tap` |
+| `spectrum/stream_client.py` | wire protocol + listener for the on-scope tap |
+| `spectrum/frametime.py` | per-frame timing: where a slow frame went |
+| `spectrum/native_acq.py` | drives acquisition via `DrvAcquire_*` on the scope |
+| `device/tap_stream.py` | injects the tap and starts it streaming |
+| `device/libmhotap.c` | the tap itself — runs *inside* the scope app (aarch64) |
+| `device/mho_tap.js` | Frida script that loads and wires up the tap |
+| `device/build_tap.sh` | cross-compiles `libmhotap.so` (needs `$ANDROID_NDK`) |
+| `device/rigol_mho.py` | SCPI client (stdlib only) |
+| `device/adb.py` | adb/frida plumbing: connect, root, frida-server, find the app pid |
+| `docs/SPECTRUM_ANALYSER_FEATURES.md` | **the roadmap** — 199 features scored against what exists |
+
+## Where the project is going
+
+`docs/SPECTRUM_ANALYSER_FEATURES.md` surveys what real spectrum analysers do
+(Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, and the SDR tools) and
+scores all 199 features against this codebase: **21 Done, 17 Partial, 146
+Missing, 15 N/A on this hardware.** It ends with a five-phase build order.
+
+**Phase 1 — make the existing display honest and measurable.** The current
+display is a good FFT viewer and not yet an analyser: it has no reference
+level, no markers, no true RBW, and its amplitude axis is dBFS rather than
+anything absolute. Phase 1 fixes that, and every item in it is PC-side work
+that the synthetic source exercises — no scope required.
+
+Two findings from the survey worth knowing before you touch the code:
+
+* **`Spectrum.resolution` is bin spacing, not RBW.** It is `sample_rate / n`
+  (`spectrum/spectrum.py`), and the status bar honestly says `Hz/bin` — but
+  there is no ENBW anywhere in the codebase, and a hann window's true
+  resolution bandwidth is ~1.5× the bin spacing. Anything claiming dBm/Hz, a
+  noise marker, or channel power needs the ENBW correction first.
+* **Absolute amplitude units are blocked at the transport, not the display.**
+  `device/libmhotap.c` zeroes its record header and writes only magic, sequence,
+  sample count, bytes-per-sample and sample rate — no `yincrement`/`yorigin`/
+  `yreference`. The SCPI path (`device/rigol_mho.py`) has them. So dBm/dBV over
+  the tap needs a header change and a rebuilt `libmhotap.so`, not just GUI work.
+
+## What this hardware can and cannot do
+
+Being accurate about this saves chasing features that cannot exist here:
+
+* **No tuner or mixer.** The analyser sees DC to Nyquist and nothing above it.
+  There is no RF centre-frequency tuning in the swept-analyser sense.
+* **Not a real-time analyser.** A ~500 µs record every ~75–90 ms is under 1%
+  duty cycle. Persistence and spectrogram displays are worth building, but
+  100% probability-of-intercept and frequency-mask triggering are not
+  achievable — do not let the UI imply otherwise.
+* **Dynamic range is set by the scope's front end.** SFDR is ~60 dB, limited
+  by ADC interleave spurs at multiples of fs/16 (they are a hardware artifact,
+  not harmonics of the signal — annotating them is a Phase 1 item).
+
+## Relationship to mho-speed-patch
+
+The [mho-speed-patch](../rigol) repo (`~/Source/rigol`) is a separate product:
+it makes the scope's *SCPI readout* fast by resizing TCP buffers, pinning the
+readout threads to the RK3399's A72 cores, and adjusting worker nice levels.
+
+This repo does not use it and does not need it. The tap bypasses the SCPI reply
+path the patch exists to accelerate. The only overlap is device plumbing —
+`device/adb.py` is the adb/frida half of that repo's `patch/patch_scope.py`,
+extracted; and `device/rigol_mho.py` is a copy of its SCPI client, which it
+still uses for its own tools. Both copies are expected to stay similar, so a
+fix about *reaching the device* probably belongs in both.
+
+Running the speed patch alongside this is only useful for the plain `scpi`
+source, where it does make readout faster.
