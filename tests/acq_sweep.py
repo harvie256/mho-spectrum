@@ -178,12 +178,12 @@ def restore_state(ip: str, orig: dict) -> None:
 # tap_stream.py's own lines, via adbutil.log.  Formats as of 2026-09-13; if a
 # field goes missing here, check the f-strings in device/tap_stream.py.
 RE_PRIMED = re.compile(r"CH\d+ (?:WORD|BYTE): (\d+) pts")
+# The export capture loop's stats line.  Logs from the old SCPI-driven loop
+# (empty=, decl=, chunks=...) do not match and parse as no tap stats.
 RE_TAPSTAT = re.compile(
     r"tap\s+([\d.]+) fps\s+([\d.]+) MB/s\s+in=(\d+) sent=(\d+) dropped=(\d+)"
-    r"\s+cycles=(\d+) arm=(\d+)ms .*?trig=(\d+)ms empty=(\d+) decl=(-?\d+) "
-    r"armTO=(\d+) missedBusy=(\d+)"
-    # Record assembly, added with chunked deep records; absent in older logs.
-    r"(?: chunks=(\d+) partial=(\d+) incomplete=(\d+))?")
+    r"\s+cycles=(\d+) arm=(\d+)ms rnt=(\d+)ms lock=(\d+)ms export=(\d+)ms "
+    r"cycle=(\d+)ms armTO=(\d+) expErr=(\d+)")
 
 
 def parse_tap_log(path: str) -> dict:
@@ -201,21 +201,17 @@ def parse_tap_log(path: str) -> dict:
         # (bar the final <2 s, which is after measurement ended anyway).
         s = stats[-1]
         out.update(tap_fps=float(s[0]), tap_dropped=int(s[4]),
-                   cycles=int(s[5]), arm_ms=int(s[6]), trig_ms=int(s[7]),
-                   empty_total=int(s[8]), arm_timeouts_total=int(s[10]),
-                   missed_busy=int(s[11]))
+                   cycles=int(s[5]), arm_ms=int(s[6]), rnt_ms=int(s[7]),
+                   lock_ms=int(s[8]), export_ms=int(s[9]), cycle_ms=int(s[10]),
+                   arm_timeouts_total=int(s[11]),
+                   export_errors_total=int(s[12]))
         # The warning counters are taken relative to the first report, which
-        # covers the tap's startup.  Both live runs at 2 ms / 1M had 1-3 empty
-        # replies in the first 2 s and none after (2026-09-13); counting those
-        # would WARN every point on a startup transient, not on the capture.
-        # Needs two reports, i.e. a session longer than ~4 s.
+        # covers the tap's startup -- counting a transient there would WARN
+        # every point on the session start, not on the capture.  Needs two
+        # reports, i.e. a session longer than ~4 s.
         base = stats[0] if len(stats) > 1 else ("0",) * len(s)
-        out.update(empty=int(s[8]) - int(base[8]),
-                   arm_timeouts=int(s[10]) - int(base[10]))
-        if s[12]:
-            out.update(chunks=int(s[12]),
-                       partial=int(s[13]) - int(base[13] or 0),
-                       incomplete=int(s[14]) - int(base[14] or 0))
+        out.update(arm_timeouts=int(s[11]) - int(base[11]),
+                   export_errors=int(s[12]) - int(base[12]))
     out["tap_warnings"] = len(re.findall(r"WARNING", text))
     return out
 
@@ -451,13 +447,9 @@ def judge(cfg: dict, r: dict) -> tuple[str, list[str]]:
         # dropped because the sender or the display could not keep up are
         # expected to fall off with record size, and are reported, not warned
         # on.  Only signs the capture itself misbehaved are.
-        for k, what in (("arm_timeouts", "arm timeouts"),
-                        ("empty", "empty replies"),
-                        # Dropped, never displayed -- but a depth that keeps
-                        # producing these is not delivering its records.
-                        ("partial", "partial records discarded"),
-                        ("incomplete", "cycles re-armed before the record "
-                                       "completed")):
+        for k, what in (("arm_timeouts", "captures with no ReadNormTrace "
+                                         "success in 2 s"),
+                        ("export_errors", "exports that returned an error")):
             if r.get(k):
                 warn.append(f"{r[k]} {what}")
     if "gui_rc" in r or "gui_error" in r:

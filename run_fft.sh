@@ -8,26 +8,23 @@
 #                                       arguments needed for normal use
 #
 # Or name a source directly:
-#   ./run_fft.sh tap <scope-ip>         live off the scope, fastest, ~15 fps
+#   ./run_fft.sh tap <scope-ip>         live off the scope, fastest, ~16 fps
 #   ./run_fft.sh scpi <scope-ip>        live over plain SCPI, slower
 #   ./run_fft.sh synthetic              synthetic signal, no scope needed
 #   ./run_fft.sh stream [--port 5560]   listen for a tap started elsewhere
 #
-# The 'tap' source makes four changes to the running scope while it streams,
-# all restored when the demo exits:
+# The 'tap' source runs its capture loop inside the scope app (no SCPI per
+# frame) and streams every enabled channel.  It changes the running scope in
+# these ways, all restored when the demo exits:
 #   * its waveform redraw is paused (that plot thread holds an A72 at ~99%,
 #     and the scope's screen holds its last trace)          --no-tap-quiet-ui
-#   * the hardcoded 20 ms sleep it takes before answering any SCPI command is
-#     shortened to 1 ms, which the tap pays once per frame
-#                                                          --tap-keep-scpi-sleep
 #   * logd is stopped: the scope's own logging is the largest non-app CPU
 #     consumer while streaming, worth 0.62 of a core           --tap-keep-logd
-#   * the ADC settling wait in the arm path is cut 20 ms -> 10 ms -- currently
-#     OFF by default (fft_gui.py) while suspected of stalls --tap-keep-adc-sleep
-# The first two are worth 11.3 -> 13.9 fps and remove the stalls; logd took
-# the box from 88.8% to 81.7% busy, and the ADC wait ~12.9 -> ~14.8 fps
-# (measured 2026-09-13).  Nothing is logged on the scope while it streams.
-# That is the whole set.
+#   * optionally, the ADC settling wait in the arm path is cut 20 -> 10 ms --
+#     currently OFF by default (fft_gui.py)              --tap-keep-adc-sleep
+# Measured 2026-09-13 over USB gigabit: one channel 16.2 fps at 2 ms/div 1 Mpt
+# (19.9 at 100 us/div 10 k), CH1+CH2 8.7 fps.  Nothing is logged on the scope
+# while it streams.
 #
 # Any further arguments are passed straight through to fft_gui.py, so
 # --average, --window, --points, --headless, --run-seconds etc. all work.
@@ -63,7 +60,7 @@ export PYQTGRAPH_QT_LIB
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 py="$root/.venv/bin/python"
 
-usage() { sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage

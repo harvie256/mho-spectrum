@@ -26,7 +26,7 @@ verified with no scope attached — use it.
 `docs/SPECTRUM_ANALYSER_FEATURES.md` is the plan: 199 features from real
 analysers (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, SDR tools),
 each scored Status / Effort / Value against this code, then a five-phase order.
-Currently 54 Done, 18 Partial, 112 Missing, 15 N/A on this hardware.
+Currently 54 Done, 19 Partial, 111 Missing, 15 N/A on this hardware.
 
 **Phase 1 is done** except the blind-time readout, which is not built. Phase 2
 (multiple traces, finishing absolute units, the measurement suite) is next; the
@@ -48,22 +48,30 @@ trace-mode restructure below is its first real obstacle.
   then leaves dBV/dBm reading as dBFS. So the scale goes stale if V/div changes
   mid-session, and the `scpi` source (`ScpiSource`) never fills `yinc` at all —
   it is dBFS-only. dBm assumes 50 Ω.
-* **Above 1 Mpt the record arrives in 1 Mpt chunks, and the read has to wait.**
-  `CApiWave::toWord` is called once per chunk (10 calls at 10 M), and a
-  `:WAV:DATA?` sent the instant the capture goes idle gets one chunk — then
-  every later cycle gets one chunk too, until a ~200 ms pause clears it.
-  `libmhotap.c` reassembles by record size and adapts the read delay (200 ms
-  to recover, 40 ms once whole; measured at 10 M only, scaled per Mpt
-  elsewhere). Before that, 10 M shipped 1 Mpt fragments labelled 500 MSa/s: a
-  1 MHz tone read as 10 MHz, at "6 fps, 12 MB/s". Check any depth work with
-  `tests/acq_sweep.py --tone`; details in `docs/SCOPE_INTERNALS.md`.
-* **Fast timebases need the read held back, whatever the depth.** At 100 µs/div
-  the capture is idle ~1 ms after arming; a `:WAV:DATA?` sent then makes the
-  app wait ~2 s for a waveform that never comes, and the queued re-arms drain
-  as empty blocks — a 2.0–2.1 s stall. It is capture *time*, not points (1 k,
-  10 k, 1 M all did it). `libmhotap.c` holds the read until `SHORT_CAPTURE_US`
-  (20 ms) after the arm; measured 8 stalls/25 s at 0 ms, 1 at 10 ms, 0 at
-  20 ms, and 4–5 → 17 fps. Longer captures are already past it and pay nothing.
+* **The tap is sequenced on the app's own event and lock — never fix a race
+  on it with a delay.** `libmhotap.c`'s capture loop arms SINGLE, waits for
+  `CDrvScope::ReadNormTrace` to return 0 (a return hook in `mho_tap.js`), takes
+  `CDrvScope::LockConfig`, then calls `DrvWaveform_ExportInit/ExportData/
+  ExportBack` — the functions `:WAV:DATA?` itself ends up in — straight into the
+  send buffer. Both waits are load-bearing: exporting before ReadNormTrace
+  succeeds races the app's own readout (a 1 M export went 3.4 → 65 ms), and
+  exporting before the lock is free races the `SetState` calls `CDrvScope::run`
+  makes under it (the c2h read blocked 1 s, returned `-5`, and the app sat at
+  `-3` for 2 s). The SCPI-driven loop this replaced papered over the same races
+  with three delays — a 20 ms short-capture floor, deep-record settle
+  hysteresis, a 120 ms two-channel floor — and lost fps for it; all are gone.
+  Measured 2026-09-13 over USB gigabit: one channel 16.2 fps at 2 ms/div 1 M,
+  19.9 at 100 µs/div 10 k, 14.3 at 1 GSa/s, 1.72 at 10 M (the link). Check depth
+  or rate work with `tests/acq_sweep.py --tone`; timelines in
+  `docs/SCOPE_INTERNALS.md`.
+* **Every enabled channel is streamed, interleaved, whether you look at it or
+  not.** `ExportData` returns `[CH1, CH2, CH1, CH2, …]` for all channels switched
+  on, so enabling a second one doubles the bytes: CH1+CH2 at 1 M runs 8.7 fps,
+  capped by the ~35 MB/s USB link (the loop itself does ~10 captures/s and drops
+  the rest on the scope). The header carries the count (offset 18) and a channel
+  mask (offset 20); `StreamServer` splits the frame and `get_group()` returns one
+  `Frame` per channel. There is one vertical scale per frame, so dBV/dBm are
+  only right while the channels share a V/div.
 * **Peak hold is applied after averaging**, in the same chain — it is
   max-hold-of-the-average, not an independent trace. Real trace modes
   (clear-write / max / min / average / view / blank as separate traces) are a
@@ -71,9 +79,10 @@ trace-mode restructure below is its first real obstacle.
 * **Averaging is exponential-only and never completes** — there is no
   average-count that terminates, which is what bench analysers do.
 * **Don't claim RTSA behaviour in the UI.** A 1 Mpt record at 50 MSa/s is
-  20 ms of signal, and the frame period is ~65 ms, so ~31% is observed and
-  ~69% is blind (measured 2026-09-13; an earlier note here said "under 1%",
-  which was for a much shorter record and is long stale). Better, but still
+  20 ms of signal, and the frame period is ~62 ms (16.2 fps, export loop,
+  2026-09-13), so ~32% is observed and ~68% is blind — halve that again with a
+  second channel enabled. An earlier note here said "under 1%", which was for
+  a much shorter record and is long stale. Better, but still
   not real-time: persistence and spectrogram are fine and worth building;
   100% POI and frequency-mask trigger are not achievable here.
 * **Spurs at multiples of fs/16 are an ADC interleave artifact**, not signal
@@ -86,7 +95,16 @@ trace-mode restructure below is its first real obstacle.
 arithmetic, deliberately Qt-free and the place to test it), `panels.py` (the
 FREQ/AMPT/BW/MARKER/VIEW control groups, each emitting signals and holding no
 reference to the engine), `plots.py` (spectrum pane and timing strip),
-`markers.py`, `analysis.py` (peak search, spur frequencies, CSV).
+`markers.py`, `analysis.py` (peak search, spur frequencies, CSV), and
+`channels.py` (`ChannelEngines`: one `SpectrumEngine` per channel with
+`SpectrumEngine`'s own method names, so the panels wire to it unchanged).
+
+Channels are an *input*, not a trace. The window processes each acquisition as
+a group (`self.frames` / `self.spectra`) and the plot overlays every channel
+in the scope's colours, but peaks, markers, zoom-to-signal and the annotation
+block still follow one active channel (`self.active_ch`, the first). When real
+trace modes arrive, a trace should be (channel, mode) over `ChannelEngines`.
+`./run_fft.sh synthetic --synthetic-channels 2` exercises all of it.
 
 `window.py` owns the frame loop and the per-frame instrumentation, which is
 what catches a new feature's cost — that is how the peak search's 12–17 ms was
@@ -106,18 +124,25 @@ Two performance traps live in that loop:
 ## Device layer
 
 `device/` is everything that talks to the scope. `tap_stream.py` injects
-`libmhotap.so` via Frida and starts it streaming; `adb.py` is the plumbing
+`libmhotap.so` via Frida, primes the acquisition over SCPI (the only SCPI it
+sends), and starts the on-scope capture loop; `adb.py` is the plumbing
 underneath (connect, root, provision frida-server, find the app pid).
 
-The tap can make four temporary changes to the running scope, all restored on
-exit. Three are on by default: it pauses the scope's own waveform redraw (that
-plot thread holds an A72 at ~99%) and shortens the app's hardcoded 20 ms
-per-SCPI-command sleep to 1 ms — together worth 11.3 → 13.9 fps — and it stops
-logd. The fourth, cutting the ADC settling wait in the arm path from 20 ms to
-10 ms (`ADC_SETTLE_SPEC` in `fft_gui.py`, ~2 fps), is **temporarily off by
-default** (`set_defaults(tap_adc_sleep=False)`) while it was suspected of the
-stalls. See `--no-tap-quiet-ui`, `--tap-keep-scpi-sleep`, `--tap-keep-logd` and
-`--tap-keep-adc-sleep`, and the `run_fft.sh` header for the measured gains.
+The tap makes up to three temporary changes to the running scope, all restored
+on exit. Two are on by default: it pauses the scope's own waveform redraw (that
+plot thread holds an A72 at ~99%), and it stops logd (0.62 of a core). The
+third, cutting the ADC settling wait on the arm path from 20 ms to 10 ms
+(`ADC_SETTLE_SPEC` in `fft_gui.py`), is **off by default**
+(`set_defaults(tap_adc_sleep=False)`); its ~2 fps was measured on the old SCPI
+loop and needs re-measuring against the export loop before it is turned back
+on. See `--no-tap-quiet-ui`, `--tap-keep-logd` and `--tap-keep-adc-sleep`.
+
+The loop's stats line (`arm= rnt= lock= export= cycle= armTO= expErr=`) splits
+each cycle by phase; `tests/acq_sweep.py` parses it (`RE_TAPSTAT`), so change
+the two together. Probing the live scope has side effects worth avoiding:
+`:MEASure:ITEM?` switches that measurement on (clear with `:MEASure:CLEar`),
+and `:ACQuire:MDEPth` only takes while running — restore and read back any
+setting a test touches.
 
 Rebuilding the tap needs the NDK: `ANDROID_NDK=... device/build_tap.sh`.
 

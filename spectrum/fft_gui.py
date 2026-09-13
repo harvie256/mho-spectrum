@@ -228,7 +228,8 @@ def build(args):
     if args.source == "synthetic":
         return SyntheticSource(npoints=args.points or 1_000_000,
                                sample_rate=args.sample_rate,
-                               fps_limit=args.synthetic_fps)
+                               fps_limit=args.synthetic_fps,
+                               channels=range(1, max(1, min(4, args.synthetic_channels)) + 1))
     if args.source == "scpi":
         if not args.host:
             raise SystemExit("--source scpi needs --host")
@@ -236,10 +237,9 @@ def build(args):
                           points=args.points)
     return StreamSource(host=args.bind, port=args.port,
                         scope_ip=args.tap or None, pc_host=args.pc_host or None,
-                        channel=args.channel, fmt=args.format,
+                        channel=args.channel,
                         scpi_ip=args.scpi_ip or None,
                         quiet_ui=args.tap_quiet_ui,
-                        no_scpi_sleep=args.tap_no_scpi_sleep,
                         quiet_logd=args.tap_quiet_logd,
                         sleep_consts=[ADC_SETTLE_SPEC] if args.tap_adc_sleep else [])
 
@@ -267,9 +267,13 @@ def run_headless(args, src, eng):
            "last_recv": None, "work_s": 0.0, "empty": 0}
     while time.time() < t_end:
         t_tick = time.perf_counter()
-        frame = src.get(timeout=2.0)
+        if hasattr(src, "get_group"):
+            frames = src.get_group(timeout=2.0)
+        else:
+            one = src.get(timeout=2.0)
+            frames = [one] if one is not None else None
         t_got = time.perf_counter()
-        if frame is None:
+        if not frames:
             # Only the part after the (blocking) get is our own work; the wait
             # itself is idle time and must not be charged to compute.
             tmr["empty"] += 1
@@ -286,7 +290,9 @@ def run_headless(args, src, eng):
                 print("  warning:", st["warning"])
             continue
         t0 = time.perf_counter()
-        spec = eng.process(frame.samples, frame.sample_rate)
+        spectra = eng.process(frames)
+        frame = frames[0]
+        spec = spectra[frame.channel]
         fft_ms.append((time.perf_counter() - t0) * 1e3)
         n += 1
 
@@ -316,7 +322,6 @@ def run_headless(args, src, eng):
 
         if time.time() - last_report >= 1.0:
             st = src.stats()
-            pk = int(np.argmax(spec.power_db))
             extra = ""
             for k in ("resyncs", "timeouts", "short", "stale", "repeats"):
                 if st.get(k):
@@ -324,9 +329,13 @@ def run_headless(args, src, eng):
             # Headless only, and deliberately terse: one line every couple of
             # seconds is a progress indicator, not a measurement.  The detail
             # lives behind --timing-report.
-            print(f"  {n:5d} frames  {st['fps']:5.1f} fps  "
-                  f"peak {spec.freqs[pk]/1e6:8.4f} MHz @ "
-                  f"{spec.power_db[pk]:6.1f} dBFS" + extra)
+            peaks = []
+            for ch, s in spectra.items():
+                pk = int(np.argmax(s.power_db))
+                peaks.append(f"{'CH%d ' % ch if len(spectra) > 1 else ''}"
+                             f"{s.freqs[pk]/1e6:8.4f} MHz @ {s.power_db[pk]:6.1f} dBFS")
+            print(f"  {n:5d} frames  {st['fps']:5.1f} fps  peak "
+                  + "  |  ".join(peaks) + extra)
             if st.get("warning") and st["warning"] != state_warn.get("last"):
                 state_warn["last"] = st["warning"]
                 print("    last warning:", st["warning"])
@@ -405,7 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="scope IP for SCPI if different from --tap")
     ap.add_argument("--port", type=int, default=5560)
     ap.add_argument("--channel", type=int, default=1)
-    ap.add_argument("--format", default="WORD", choices=("WORD", "BYTE"))
+    ap.add_argument("--format", default="WORD", choices=("WORD", "BYTE"),
+                    help="scpi source only; the tap always reads 16-bit")
     ap.add_argument("--points", type=int, default=0, help="0 = full record")
     ap.add_argument("--no-tap-quiet-ui", dest="tap_quiet_ui",
                     action="store_false",
@@ -432,6 +442,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: auto-frame the strongest signal)")
     ap.add_argument("--sample-rate", type=float, default=50e6, help="synthetic only")
     ap.add_argument("--synthetic-fps", type=float, default=20.0)
+    ap.add_argument("--synthetic-channels", type=int, default=1, metavar="N",
+                    help="synthetic only: generate CH1..CHN (1-4), each with "
+                         "its own tones, to exercise the multi-channel display")
     ap.add_argument("--poll-ms", type=int, default=10,
                     help="display timer period in ms (how often the source is "
                          "polled; also the floor on frame-to-frame jitter)")
@@ -443,14 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     tg.add_argument("--timing-csv", default="",
                     help="on exit, dump per-frame rows here (a -source.csv "
                          "companion gets the source-thread rows)")
-    tg.add_argument("--tap-keep-scpi-sleep", dest="tap_no_scpi_sleep",
-                    action="store_false",
-                    help="leave the app's hardcoded 20 ms per-SCPI-command "
-                         "sleep alone (costs ~2.5 fps; the default is to "
-                         "shorten it to --tap-scpi-sleep-us and restore it "
-                         "on exit)")
-    tg.set_defaults(tap_no_scpi_sleep=True)
-    # On by default for the same reason as the other two: the scope's logging
+    # On by default for the same reason as the redraw pause: the scope's logging
     # is the largest non-app CPU consumer while streaming, and none of it is
     # wanted during a measurement.  Measured 2026-09-09: 0.62 of a core back,
     # 88.8% -> 81.7% busy, 12.5 -> 13.4 fps.  logd is restarted on exit.
@@ -461,9 +467,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "starts it again on exit; use this if you need the "
                          "scope's logs while streaming")
     tg.set_defaults(tap_quiet_logd=True)
-    # On by default, alongside the redraw pause, the SCPI sleep and logd.
-    # Those four are the whole set of scope-side changes, all measured and all
-    # restored on exit.
+    # The third and last scope-side change, alongside the redraw pause and
+    # logd; all three are restored on exit.
     tg.add_argument("--tap-keep-adc-sleep", dest="tap_adc_sleep",
                     action="store_false",
                     help="leave the ADC settling wait at its stock 20 ms. By "
@@ -527,7 +532,10 @@ def main():
         if args.tap != cfg.get("scope_ip", ""):
             save_settings(scope_ip=args.tap, source="tap")
 
-    eng = SpectrumEngine(window=args.window, averaging=args.average)
+    # One engine per channel, driven as one; a single-channel source simply
+    # only ever creates CH1's.
+    from channels import ChannelEngines
+    eng = ChannelEngines(window=args.window, averaging=args.average)
     src = build(args).start()
     try:
         if args.headless:

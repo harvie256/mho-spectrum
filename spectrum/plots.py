@@ -17,6 +17,11 @@ from pyqtgraph.Qt import QtCore
 from spectrum import reduce_for_display
 from viewmodel import FreqView
 
+# The scope's own channel colours, so a trace here reads as the same channel
+# on the instrument's screen.  One channel keeps the original blue.
+CHANNEL_COLOURS = {1: "#e8e020", 2: "#20d0e8", 3: "#e040e0", 4: "#4a80ff"}
+SINGLE_COLOUR = "#1f9bd1"
+
 
 class TimedPlotWidget(pg.PlotWidget):
     """A PlotWidget that adds up the time Qt spends repainting it.
@@ -56,6 +61,9 @@ class SpectrumPlot(QtCore.QObject):
         self.display_bins = display_bins
         self.detector = "+peak"
         self._spec = None
+        self._specs: dict = {}         # channel -> Spectrum, all drawn
+        self._curves: dict = {}        # channel -> curve, once there are several
+        self._legend = None
         self._syncing = False          # guards the view <-> viewbox round trip
         # Reduction time, accumulated across every call in a frame and drained
         # by the frame loop.  It is counted here rather than at the call site
@@ -69,7 +77,7 @@ class SpectrumPlot(QtCore.QObject):
         self.plot.setLabel("left", "Power", units="dBFS")
         self._unit = "dBFS"
         self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.curve = self.plot.plot(pen=pg.mkPen("#1f9bd1", width=1))
+        self.curve = self.plot.plot(pen=pg.mkPen(SINGLE_COLOUR, width=1))
 
         self.plot.getViewBox().sigXRangeChanged.connect(self._on_x_range)
 
@@ -109,7 +117,30 @@ class SpectrumPlot(QtCore.QObject):
 
     # -- data -------------------------------------------------------------
     def set_spectrum(self, spec):
-        self._spec = spec
+        self.set_spectra({1: spec} if spec is not None else {})
+
+    def set_spectra(self, spectra: dict):
+        """Draw these spectra, keyed by channel.  One channel uses the single
+        curve; several get a curve each in the channel colours, and a legend."""
+        self._specs = dict(spectra)
+        self._spec = next(iter(self._specs.values()), None)
+        multi = len(self._specs) > 1
+        self.curve.setVisible(not multi)
+        if multi and self._legend is None:
+            self._legend = self.plot.addLegend(offset=(-10, 10))
+        for ch in list(self._curves):
+            if not multi or ch not in self._specs:
+                if self._legend is not None:
+                    self._legend.removeItem(self._curves[ch])
+                self.plot.removeItem(self._curves.pop(ch))
+        if multi:
+            for ch in self._specs:
+                if ch not in self._curves:
+                    self._curves[ch] = self.plot.plot(
+                        pen=pg.mkPen(CHANNEL_COLOURS.get(ch, "#c0c0c0"), width=1),
+                        name=f"CH{ch}")
+        if self._legend is not None:
+            self._legend.setVisible(multi)
 
     def redraw(self):
         t0 = time.perf_counter()
@@ -130,16 +161,16 @@ class SpectrumPlot(QtCore.QObject):
         self.plot.setLabel("left", "Power", units=unit)
 
     def _redraw(self):
-        spec = self._spec
-        if spec is None:
+        if not self._specs:
             return
-        f, d = reduce_for_display(spec.freqs, spec.power_db, self.display_bins,
-                                  fmin=self.view.lo, fmax=self.view.hi,
-                                  detector=self.detector)
-        if self.view.log_x:
-            keep = f > 0          # log-x cannot show DC
-            f, d = f[keep], d[keep]
-        self.curve.setData(f, d)
+        for ch, spec in self._specs.items():
+            f, d = reduce_for_display(spec.freqs, spec.power_db, self.display_bins,
+                                      fmin=self.view.lo, fmax=self.view.hi,
+                                      detector=self.detector)
+            if self.view.log_x:
+                keep = f > 0          # log-x cannot show DC
+                f, d = f[keep], d[keep]
+            (self._curves.get(ch) or self.curve).setData(f, d)
 
 
 class TimingStrip:

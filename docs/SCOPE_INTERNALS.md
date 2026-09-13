@@ -132,69 +132,83 @@ in string/table/CAN-decoder/zlib code, nothing in the waveform path.
 `i` from 0 to `2n` calling `RByteArray::append(ptr, 1)` — **one byte at a time**, ~2M
 calls for a 1 Mpt record. That is the ~110 ms per frame the tap exists to bypass.
 
-### Deep records: chunked, and not ready when the capture is
+What feeds it (static, 2026-09-13): `:WAV:DATA?` → `CApiWave::getData`, which asks for
+the record in chunks of `1,000,000 / GetChanCount()` points → `getWfmData` →
+`getMemoryData(buf, start, count)`, which does `DrvWaveform_ExportInit(0)`,
+`DrvWaveform_ExportData(start × channels, count × channels, buf, false)` and
+`DrvWaveform_ExportBack()`, then picks the requested channel out of the result with a
+byte loop (every other uint16 with two channels on) and hands it to `toFormat`. So one
+export already holds **every enabled channel, interleaved**. `CDrvScope::ExportData`
+programs `DevAcquireSPU_SetWaveRange`/`SetTxInfo`/`TxFrmHead`, calls
+`RequestNormTrace`, and reads the samples with `DevAnalyzeTrace_Read` — an ioctl and a
+blocking `read()` on the c2h stream.
 
-Measured 2026-09-13 at 2 ms/div, 10 M points, 500 MSa/s, 1 MHz on CH1.
+### How the tap reads now: direct export
 
-**The record itself is fine.** SCPI RAW slices at points 1, 1M, 5M and 9.98M all
-show 500.0 samples per period, and a full read is announced as 20,000,000 bytes.
+The tap calls those three export functions itself, from its own thread, into its send
+buffer — no SCPI in the frame loop, no byte loop, no copy (`export_main` in
+`device/libmhotap.c`). *When* to call them came from timestamping the app's own
+functions with an observe-only Frida hook (arm, `ReadNormTrace` enter/leave/return,
+`ExportData`, `getMemoryData`, `toWord`, per thread):
 
-**It reaches `toWord` in pieces.** One `:WAV:DATA?` makes the app call
-`CApiWave::toWord` ten times, 1,000,000 contiguous points each; the reply header
-follows after 72-221 ms. The tap had assumed one call per record — true up to 1 Mpt.
+* **The acquisition thread polls `CDrvScope::ReadNormTrace`** from `CDrvScope::run`
+  every ~10 ms: `-3` until a capture is in, `0` once it has read it for its own display
+  (success at a median 87 ms after the arm with one channel, 101 ms with two).
+* **The old SCPI-driven tap ran a cycle out of step.** Its `:WAV:DATA?` export started
+  after the next arm, all 90 of 90 overlapped an arm and a `ReadNormTrace`, the arm
+  blocked 36 ms on `LockConfig`, and a 1 M export took **65 ms** — against **3.4 ms**
+  when nothing overlaps it.
+* **`ReadNormTrace` success is necessary but not sufficient.** `CDrvScope::run` holds
+  `CDrvScope::LockConfig` around `ReadNormTrace` *and* the `SetState` calls after it,
+  which reprogram the same SCU/SPU registers an export uses. A prototype that exported
+  on the success alone failed ~8 cycles in 60: the export blocked 1,005 ms in the c2h
+  read and returned `-5`, the app's next `ReadNormTrace` failed the same way after 1 s,
+  and it then returned `-3` for 2 s. Taking `LockConfig` around the export fixed it
+  outright (lock wait ~1 ms); the export functions do not take that lock themselves.
 
-**Read too early and it stays broken.** From the host every read came back whole,
-whatever else was on: quiet UI, the SCPI-sleep hook, native SINGLE arming, logd
-stopped. The on-scope driver, which reads within microseconds of the capture going
-idle, got one chunk and no reply, every cycle. A delay swept inside the driver
-(10 s each):
+So a cycle is: `SetState(3)` → wait for a `ReadNormTrace` success (return hook in
+`mho_tap.js` → `mhotap_rnt_done`) → `LockConfig` → export in 1 M-per-channel chunks →
+`UnlockConfig` → publish. Measured 2026-09-13, USB gigabit, 25–30 s per point, 0 export
+errors, 0 timeouts, 0 repeated frames:
 
 ```
-from a working state   200 / 60 / 40 ms   whole, 1.8 fps, 36 MB/s
-                       20 ms              whole, 1.7 fps
-                       10 ms              4.5 chunks/cycle, half the records partial
-                       0 ms               1 chunk/cycle, nothing delivered
-from a broken state    40 / 120 / 150 ms  still 1 chunk/cycle
-                       200 ms             recovers within a few cycles
-fresh session          40 / 20 ms         broken from the first cycle
+one channel   100 us/div  10 k  10 MSa/s    19.9 fps
+              100 us/div   1 M   1 GSa/s    14.3 fps
+                2 ms/div 100 k   5 MSa/s    18.2 fps
+                2 ms/div   1 M  50 MSa/s    16.2 fps  (arm 23, wait 33, export 5 ms)
+               20 ms/div  10 M  50 MSa/s     1.72 fps (34 MB/s: the link; 47 dropped)
+CH1+CH2         2 ms/div   1 M  50 MSa/s     8.7 fps  (wait 87, export 7 ms; ~10
+                                                        captures/s, link carries 8.7)
 ```
 
-So the failure latches, and getting out of it needs about 200 ms where staying out
-needs 20. The driver now starts each session at 200 ms, drops to 40 ms after three
-whole records, and goes back to 200 on any broken one (`settle_adapt` in
-`device/libmhotap.c`). A broken record at the low value also doubles it (capped at the
-high one), and five broken in a row at the high value double that, up to 2 s
-(`SETTLE_*`); `mhotap_drive_settle()` pins a fixed delay instead. The per-Mpt
-scaling it applies at other depths (`SETTLE_HI_US_PER_MPT` 20 ms, `SETTLE_LO_US_PER_MPT`
-4 ms) is an assumption; only 10 M was measured. The reply-header wait scales the same
-way: `REPLY_HDR_MS` 120 plus `REPLY_MS_PER_MPT` 30 per Mpt beyond the first.
+Frames were checked offline: a 1 MHz tone on CH1 peaks at 1.000000 MHz at every setting
+above, and in the two-channel frame CH2 peaks at 2.999999 MHz with a CH1/CH2
+correlation of 0.000 — the interleave is split correctly. The same settings on the SCPI
+loop gave 17 (with a 20 ms delay), 13–14.5, and 1.81 fps.
 
-**What it looked like before.** Each chunk went out as a frame labelled with the
-record's rate, and the one chunk a broken cycle produced had been read before the
-app finished filling it: ~333k real samples, then ~667k of a 10x decimated trace. A
-1 MHz input peaked at 10 MHz (-5.8 dBFS), with the true tone at -25 dBFS, at
-6 fps x 2 MB = 12 MB/s.
+### History: the SCPI-driven loop and its delays
 
-**After.** 10 M: 1.81 fps, 36.2 MB/s, every frame 10,000,000 points, 0 partial, 0
-incomplete, the 1 MHz tone in place. 54 of 81 records were dropped on the scope
-because the link is the limit at 20 MB a record. 1 M: 13.8 fps, unchanged (it is a
-single call and skips the settle hysteresis; its ~24 ms capture also clears the
-short-capture floor below, so it pays no delay at all).
+Until 2026-09-13 the tap made the app produce each record by sending `:WAV:DATA?` over
+loopback and caught it in a `toWord` hook. Every race above then surfaced as a
+separate symptom, each fixed with a delay; they are recorded because the symptoms are
+what you see if anything ever reads the record over SCPI again.
 
-### Fast timebases: a read too soon after a short capture stalls 2 s
+* **Deep records arrive in chunks, and a read too early latches broken.** At 10 M one
+  query made ten 1 M `toWord` calls; a query within microseconds of idle got one chunk,
+  and every later cycle did too until a ~200 ms pause (settle hysteresis 200 → 40 ms).
+  Before reassembly, 10 M shipped 1 M fragments labelled 500 MSa/s: a 1 MHz tone read
+  as 10 MHz.
+* **Another enabled channel splits a 1 M record too** — `getData`'s
+  `1,000,000 / channels` — into calls of 500,000 (three under plain SCPI, the later ones
+  370–850 ms after the query). A tap sized from depth dropped 84 of 86 records
+  (13 → 0.09 fps); the fix needed a 2 s record wait and a 120 ms read floor (a pinned
+  40 ms latched into a 15.7 s gap) and still only reached 4.35 fps.
+* **Fast timebases stalled 2 s.** At 100 us/div the capture is idle ~1 ms after arming;
+  a query then made the app hold it ~2 s, and queued re-arms drained as empty blocks.
+  Swept: 0 ms 8 stalls/25 s, 10 ms 1, 20 ms 0, so a 20 ms floor after the arm.
 
-A one-call record wants a delay too, for a different reason. At 100 us/div the capture
-is idle ~1 ms after arming, and a `:WAV:DATA?` sent then often reaches the app before it
-has taken the record in. The app holds the query ~2 s waiting for a waveform a stopped
-SINGLE never produces, each re-arm queues another behind it, and the backlog drains as
-empty blocks: a 2.0-2.1 s stall. It follows capture time, not depth (1 k, 10 k and 1 M
-all stalled at 100 us/div). Measured 2026-09-13 at 100 us/div, 10 k, 25 s each, delay
-after idle vs stalls over 1 s: 0 ms 8, 2 ms 6, 5 ms 8, 10 ms 1, 20 ms 0.
-
-So for one-call records (and no pinned settle) `driver_main` waits until
-`SHORT_CAPTURE_US` (20 ms) after the arm before reading; a capture already that long
-pays nothing. Built in: 0 stalls, 4-5 -> 17 fps at 100 us/div, 10 k. The driver's
-`settle_ms` stat reports the delay actually applied, short captures included.
+Those floors also cost single-channel speed (14–14.5 fps fell to ~13). Direct export
+needs none of them.
 
 ### Sleep cadence
 
@@ -303,9 +317,9 @@ logcat -b all    -f /data/logs/tools_log/logcat_1.txt -r 1024 -n 4
 
 **It is the ingestion that costs, not the readers** — killing both file drains recovered
 only 0.10 of a core, while stopping `logd` recovered all 0.62. So the fix is `stop logd`,
-and it is now the tap's third temporary change (`--quiet-logd` in `tap_stream.py`, on by
-default from `fft_gui.py`/`run_fft.sh`, disabled with `--tap-keep-logd`), restarted on exit alongside the redraw
-and the SCPI sleep. Nothing is logged on the scope while it streams. If the tap is killed
+and it is now one of the tap's temporary changes (`--quiet-logd` in `tap_stream.py`, on by
+default from `fft_gui.py`/`run_fft.sh`, disabled with `--tap-keep-logd`), restarted on exit alongside the
+redraw. Nothing is logged on the scope while it streams. If the tap is killed
 hard, `logd` stays stopped until `adb shell start logd` or a reboot.
 
 Note that `logcatext` is respawned by a supervisor when killed, but the two `logcat`
@@ -338,12 +352,13 @@ USB2 sockets and a 100 MbE port, both tested (2026-09-09). So the USB2 adapter a
 adapter to a USB3 port; that was wrong, and no such port exists.
 
 At 2 MB per frame a 35 MB/s ceiling puts a hard bound of ~17.5 fps on 1 Mpt streaming
-even if everything else were free, against 11.4–13.3 fps measured. That leaves two
-levers, and only two: **send fewer bytes** (the tap already knows how — `mho_tap.js`
-maps `CApiWave::toByte` at 1 byte/sample against `toWord` at 2, so 8-bit halves the
-payload at a cost in dynamic range worth measuring against the ~60 dB SFDR floor), or
-**overlap transfer with acquisition** so the frame period tends to `max(wait, read)`
-rather than their sum.
+even if everything else were free, against 11.4–13.3 fps measured on the SCPI-driven
+loop (16.2 fps on direct export, 2026-09-13 — close to that bound, and at 10 M or with
+two channels the link is plainly the limit). That leaves two levers: **send fewer
+bytes** (direct export reads 16-bit words only; the old `toByte` 8-bit route went with
+the SCPI loop, so this would now mean a PC-agreed 8- or 12-bit encoding on the scope —
+see the packing trial below, which bought nothing at 1 channel), or **overlap transfer
+with acquisition** so the frame period tends to `max(wait, read)` rather than their sum.
 
 Open and unmeasured: whether the 57 ms payload is bus-limited or **CPU**-limited. The
 scope is 89% busy with 2.5 cores in the kernel while it streams, so 35 MB/s may not be
@@ -389,10 +404,12 @@ or one of `/rigol/tools/{tcpsvd,ftpd}`.
 
 ## Stale numbers elsewhere in this repo
 
-`CLAUDE.md` and `tap_stream.py`'s `--quiet-ui` help describe the scope's plot thread as
-"~60% of a core" (`run_fft.sh`'s help has since been corrected to ~99%). Measured
-2026-09-08 it is **98.7–100% of an A72** at idle. The tap's 11.3 → 13.9 fps
-figure still holds (11.4–13.3 fps measured over long runs).
+The scope's plot thread was once described here and in `CLAUDE.md` as "~60% of a core";
+measured 2026-09-08 it is **98.7–100% of an A72** at idle, and the docs now say so.
+Every fps figure in the sections below this one (the log pipeline, 12-bit packing, A53
+pinning, the acquisition cycle and the ADC patch) was measured on the **SCPI-driven
+loop** that direct export replaced on 2026-09-13. The mechanisms still hold; the numbers
+need re-measuring against the export loop before they are relied on.
 
 ## Tried and removed: 12-bit packing, and A53 pinning
 
@@ -422,10 +439,14 @@ pay, and a flag that only buys consistency was not worth the surface.
 
 ## The acquisition cycle: where the frame time goes
 
-From the tap's own instrumentation (`tap_stream.py --drive-poll-ms`/`--drive-csv`; the
-`fft_gui.py` equivalents have since been removed), 761 cycles,
-medians. Note `arm_ms` as logged is `t2 - t0` and *includes* the busy wait, so the
-`set_state` call alone is `arm - wait_busy - busy`, computed per cycle:
+*This breakdown is of the old SCPI-driven loop (2026-09-09). The export loop's own is in
+"How the tap reads now" above — at 2 ms/div 1 M: arm 23, ReadNormTrace wait 33, lock
+~1, export 5 ms, 62 ms a cycle — and `tap_stream.py --drive-poll-ms --drive-csv` now
+records those phases per cycle.*
+
+From the tap's own instrumentation at the time, 761 cycles, medians. Note `arm_ms` as
+logged then was `t2 - t0` and *included* the busy wait, so the `set_state` call alone
+is `arm - wait_busy - busy`, computed per cycle:
 
 ```
 set_state(SINGLE)     31.6 ms   arming
@@ -443,7 +464,8 @@ return address, three sleeps fire exactly once per acquisition:
 20000us  CCalibration_ADC::DrvCalibration_SetAdcStary   movz at +0x3417fc
 10000us  CDrvScope::ReadNormTrace                       movz at +0x30ef60
 10000us  CDrvScope::run  (usleep(n * 1000), multiplier) movz at +0x2e945c
- 1000us  CScpiParserWorker::addRemoteEvent              already cut 20->1 by the tap
+ 1000us  CScpiParserWorker::addRemoteEvent              was cut 20->1 by the tap (SCPI
+                                                         loop only; export sends no SCPI)
 ```
 
 ~40 ms of the 76 ms cycle is the app asleep on hardcoded timers.
@@ -454,9 +476,10 @@ Each constant is a plain `mov w<rd>, #imm` a couple of instructions before the `
 so it can be rewritten in place — restored on exit, and refused unless the instruction
 really is a movz/movk with the expected immediate (`patchSleepConsts` in `mho_tap.js`;
 `tap_stream.py --sleep-const OFF:EXPECT_US:NEW_US`). `fft_gui.py` applies the ADC site
-as `ADC_SETTLE_SPEC` (`0x3417fc:20000:10000`), undone with `--tap-keep-adc-sleep`; as of
-2026-09-13 its default is **temporarily off** while checking whether it is behind the
-occasional stalls.
+as `ADC_SETTLE_SPEC` (`0x3417fc:20000:10000`), undone with `--tap-keep-adc-sleep`; its
+default is **off**. It was switched off while suspected of stalls that turned out to be
+the SCPI loop's races, and the table below was measured on that loop, so re-measure it
+against direct export before turning it back on.
 
 | | fps | |
 |---|---|---|

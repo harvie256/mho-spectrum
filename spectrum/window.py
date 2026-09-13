@@ -50,8 +50,14 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         # -- model --------------------------------------------------------
         self.view = FreqView(log_x=False)
         self.scale = AmpScale(ref_level=0.0, db_per_div=10.0)
+        # The active channel's frame and spectrum.  Peaks, markers, the
+        # annotation block and zoom-to-signal all work on it; every channel in
+        # self.spectra is drawn.
         self.spec = None
         self.frame = None
+        self.frames: list = []           # every channel of the last acquisition
+        self.spectra: dict = {}          # channel -> Spectrum, in display units
+        self.active_ch: int | None = None
         self.peaks: list = []
         self.frozen = False
         # Autoscale off at startup.  A bench analyser opens on a fixed
@@ -211,19 +217,33 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self._sync_view()
 
     def _reprocess(self):
-        """Recompute the stored frame under the current settings."""
-        if self.frame is None:
+        """Recompute the stored frames under the current settings."""
+        if not self.frames:
             return
-        self.spec = self._to_units(self.eng.process(self.frame.samples,
-                                                    self.frame.sample_rate))
-        self.plot.set_spectrum(self.spec)
+        self._process_group(self.frames)
+        self.plot.set_spectra(self.spectra)
         self.plot.redraw()
 
-    def _to_units(self, spec):
+    def _process_group(self, frames):
+        """Spectra for one acquisition, in display units, and the active one.
+
+        Does not touch the plot: while frozen the numbers still follow the
+        source but the trace under the cursor must not change.
+        """
+        spectra = self.eng.process(frames)
+        for f in frames:
+            spectra[f.channel] = self._to_units(spectra[f.channel], f)
+        self.frames, self.spectra = frames, spectra
+        if self.active_ch not in spectra:
+            self.active_ch = frames[0].channel
+        self.frame = next(f for f in frames if f.channel == self.active_ch)
+        self.spec = spectra[self.active_ch]
+
+    def _to_units(self, spec, frame=None):
         """Shift a freshly computed spectrum into the selected units."""
         if spec is None:
             return spec
-        frame = self.frame
+        frame = frame if frame is not None else self.frame
         yinc = getattr(frame, "yinc", 0.0) if frame is not None else 0.0
         full_scale = float(2 ** (8 * getattr(frame, "samples", None).itemsize)) \
             if frame is not None and getattr(frame, "samples", None) is not None \
@@ -326,10 +346,14 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         # Scale from what is *visible*, not the whole record: after zooming
         # into a quiet corner, a full-span autoscale would leave the trace a
         # flat line at the bottom of a graticule sized for a distant carrier.
-        lo = int(np.searchsorted(self.spec.freqs, self.view.lo, "left"))
-        hi = int(np.searchsorted(self.spec.freqs, self.view.hi, "right"))
-        band = self.spec.power_db[max(0, lo):max(lo + 1, hi)]
-        self.scale.autoscale(band if band.size else self.spec.power_db)
+        # With several channels, fit all of them -- they share one scale.
+        bands = []
+        for s in (self.spectra.values() if self.spectra else [self.spec]):
+            lo = int(np.searchsorted(s.freqs, self.view.lo, "left"))
+            hi = int(np.searchsorted(s.freqs, self.view.hi, "right"))
+            band = s.power_db[max(0, lo):max(lo + 1, hi)]
+            bands.append(band if band.size else s.power_db)
+        self.scale.autoscale(np.concatenate(bands))
         self.amp_panel.show_scale()
         self._apply_scale()
 
@@ -340,14 +364,10 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self._show_annotation()
 
     def capture_dc(self):
-        if self.frame is None:
+        if not self.frames:
             return
-        self.eng.capture_dc(self.frame.samples)
-        if self.spec is not None:
-            self.spec = self._to_units(self.eng.process(self.frame.samples,
-                                                        self.frame.sample_rate))
-            self.plot.set_spectrum(self.spec)
-            self.plot.redraw()
+        self.eng.capture_dc(self.frames)
+        self._reprocess()
 
     def _set_frozen(self, on: bool):
         """Freeze keeps the display interactive at full bin resolution.
@@ -537,13 +557,17 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self.app.quit()
 
     def tick(self):
-        src, eng = self.src, self.eng
+        src = self.src
         t_tick = time.perf_counter()
 
         t_get = time.perf_counter()
-        frame = src.get(timeout=0.0)
+        if hasattr(src, "get_group"):
+            frames = src.get_group(timeout=0.0)
+        else:
+            one = src.get(timeout=0.0)
+            frames = [one] if one is not None else None
         get_ms = (time.perf_counter() - t_get) * 1e3
-        if frame is None:
+        if not frames:
             st = src.stats()
             if not getattr(src, "tap_alive", lambda: True)():
                 tail = src.tap_log_tail(3).strip().replace("\n", " | ")
@@ -562,17 +586,17 @@ class SpectrumWindow(QtWidgets.QMainWindow):
             return
 
         t0 = time.perf_counter()
-        spec = eng.process(frame.samples, frame.sample_rate)
+        self._process_group(frames)
+        # All channels: the frame interval pays for every FFT, not one.
         self.fft_ms = (time.perf_counter() - t0) * 1e3
-        self.frame = frame
-        self.spec = spec = self._to_units(spec)
+        frame, spec = self.frame, self.spec
 
         nyq = float(spec.freqs[-1])
         if not self._ranged or abs(nyq - self.view.nyquist) > 1.0:
             self._on_sample_rate_change(spec, nyq)
 
         if not self.frozen:
-            self.plot.set_spectrum(spec)
+            self.plot.set_spectra(self.spectra)
             self.plot.redraw()
             self.markers.refresh(spec.freqs, spec.power_db)
             self._autoscale()
@@ -718,22 +742,27 @@ class SpectrumWindow(QtWidgets.QMainWindow):
     def _show_status(self, frame, st, interval_ms: float):
         spec = self.spec
         pk = int(np.argmax(spec.power_db))
+        multi = len(self.frames) > 1
         self.status.setText(
-            f"{frame.npoints:,} pts @ {frame.sample_rate / 1e6:.1f} MSa/s  ·  "
+            (f"CH{'+'.join(str(f.channel) for f in self.frames)}  ·  " if multi else "")
+            + f"{frame.npoints:,} pts @ {frame.sample_rate / 1e6:.1f} MSa/s  ·  "
             f"src {st['fps']:.2f} fps, {st['mbps']:.1f} MB/s, "
             f"{st['dropped']} dropped"
             + (f", {st['repeats']} STALE" if st.get("repeats") else "") + "  ·  "
             f"draw {self._draw_fps():.1f} fps  ·  fft {self.fft_ms:.0f} ms  ·  "
             f"frame {interval_ms:.0f} ms (med {self.stall.median:.0f}, "
             f"worst {self.stall.worst:.0f}, {self.stall.count} stalls)  ·  "
-            f"peak {spec.freqs[pk] / 1e6:.4f} MHz @ "
+            f"peak{f' CH{self.active_ch}' if multi else ''} "
+            f"{spec.freqs[pk] / 1e6:.4f} MHz @ "
             f"{spec.power_db[pk] + self.scale.offset:.1f} {self.amp_unit}"
             + (f"  ·  DC cal {self.eng.dc_offset:+.0f} codes"
                if self.eng.dc_offset else "")
             + ("  ·  FROZEN" if self.frozen else ""))
 
     def _show_annunciators(self, frame, interval_ms: float):
-        self.annun.show_clipping(self.spec.clipped, frame.npoints)
+        # Clipping on any channel matters: its harmonics land on the shared plot.
+        clipped = max((s.clipped for s in self.spectra.values()), default=self.spec.clipped)
+        self.annun.show_clipping(clipped, frame.npoints)
 
     # -- shutdown ----------------------------------------------------------
     def teardown(self):

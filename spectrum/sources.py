@@ -103,22 +103,35 @@ class SyntheticSource:
     reference -- the peaks land where the maths says they should.
     """
 
+    # Extra channels, so a multi-channel display can be checked with no scope:
+    # each has tones of its own plus a weaker copy of CH1's 1 MHz carrier, so
+    # both "different on each channel" and "common to all" show up.
+    EXTRA_CHANNEL_TONES = {
+        2: ((2.0e6, 0.4), (5.5e6, 0.08), (1.0e6, 0.05)),
+        3: ((4.0e6, 0.3), (1.0e6, 0.02)),
+        4: ((9.0e6, 0.2), (1.0e6, 0.01)),
+    }
+
     def __init__(self, npoints=1_000_000, sample_rate=50e6,
                  tones=((1.0e6, 0.5), (3.0e6, 0.15), (7.25e6, 0.05)),
-                 noise=2e-4, fps_limit=20.0):
+                 noise=2e-4, fps_limit=20.0, channels=(1,)):
         self.npoints = npoints
         self.sample_rate = sample_rate
         self.tones = tones
         self.noise = noise
+        self.channels = tuple(channels) or (1,)
         self.min_period = 1.0 / fps_limit if fps_limit else 0.0
         self._seq = 0
         self._last = 0.0
         self._t0 = None
         t = np.arange(npoints) / sample_rate
-        base = np.zeros(npoints, dtype=np.float64)
-        for f, a in tones:
-            base += a * np.sin(2 * np.pi * f * t)
-        self._base = base
+        self._bases = {}
+        for ch in self.channels:
+            base = np.zeros(npoints, dtype=np.float64)
+            for f, a in (tones if ch == 1 else self.EXTRA_CHANNEL_TONES.get(ch, tones)):
+                base += a * np.sin(2 * np.pi * f * t)
+            self._bases[ch] = base
+        self._base = self._bases[self.channels[0]]
         self._rng = np.random.default_rng(0xC0FFEE)
         self.timing = FrameLog("source(synthetic)", SOURCE_FIELDS)
         self._last_arrival: float | None = None
@@ -131,13 +144,18 @@ class SyntheticSource:
         pass
 
     def get(self, timeout: float | None = None) -> Frame | None:
+        return self.get_group(timeout)[0]
+
+    def get_group(self, timeout: float | None = None) -> list[Frame]:
         t_wait = time.perf_counter()
         wait = self.min_period - (t_wait - self._last)
         if wait > 0:
             time.sleep(wait)
         self._last = t_gen = time.perf_counter()
-        sig = self._base + self._rng.normal(0.0, self.noise, self.npoints)
-        codes = np.clip(32768 + sig * 32000, 0, 65535).astype("<u2")
+        codes = {}
+        for ch in self.channels:
+            sig = self._bases[ch] + self._rng.normal(0.0, self.noise, self.npoints)
+            codes[ch] = np.clip(32768 + sig * 32000, 0, 65535).astype("<u2")
         self._seq += 1
         now = time.perf_counter()
         # Synthetic frames are made on the *caller's* thread, so this work lands
@@ -152,12 +170,12 @@ class SyntheticSource:
             work_ms=(now - t_gen) * 1e3,
             loop_ms=(now - t_wait) * 1e3)
         self._last_arrival = now
-        return Frame(seq=self._seq, samples=codes, sample_rate=self.sample_rate,
-                     recv_time=now)
+        return [Frame(seq=self._seq, samples=codes[ch], sample_rate=self.sample_rate,
+                      recv_time=now, channel=ch) for ch in self.channels]
 
     def stats(self):
         el = (time.perf_counter() - self._t0) if self._t0 else 0.0
-        nbytes = self._seq * self.npoints * 2
+        nbytes = self._seq * self.npoints * 2 * len(self.channels)
         return {"frames": self._seq, "dropped": 0,
                 "fps": self._seq / el if el > 0 else 0.0,
                 "mbps": nbytes / el / 1e6 if el > 0 else 0.0,
@@ -442,31 +460,28 @@ def local_ip_towards(host: str) -> str:
 
 
 class StreamSource(StreamServer):
-    """The fast path: frames pushed by the on-scope tap (stream/tap_stream.py).
+    """The fast path: frames pushed by the on-scope tap (device/tap_stream.py).
 
     Optionally launches and supervises the scope-side tap, so the whole thing is
-    one command.  The tap injects libmhotap.so, which takes the record straight
-    out of CApiWave::toWord and ships it from its own thread -- bypassing the
-    SCPI reply path entirely (~2.2x faster, and every frame verified new).
+    one command.  The tap injects libmhotap.so, whose capture loop arms the
+    scope and reads each capture with the app's own DrvWaveform_Export*
+    functions -- no SCPI per frame -- and sends every enabled channel
+    interleaved in one frame, which StreamServer splits back out.
     """
 
     def __init__(self, host="0.0.0.0", port=5560, scope_ip=None, pc_host=None,
-                 channel=1, fmt="WORD", scpi_ip=None, python=None,
+                 channel=1, scpi_ip=None, python=None,
                  drive_poll_ms=0.0, quiet_ui=False, drive_csv="",
-                 no_scpi_sleep=False, scpi_sleep_us=1000,
                  quiet_logd=False, sleep_consts=()):
         super().__init__(host, port)
         self.drive_poll_ms = drive_poll_ms
         self.drive_csv = drive_csv
-        self.no_scpi_sleep = no_scpi_sleep
-        self.scpi_sleep_us = scpi_sleep_us
         self.quiet_ui = quiet_ui
         self.quiet_logd = quiet_logd
         self.sleep_consts = list(sleep_consts or ())
         self.scope_ip = scope_ip
         self.pc_host = pc_host
         self.channel = channel
-        self.fmt = fmt
         self.scpi_ip = scpi_ip
         self.python = python or sys.executable
         self._proc = None
@@ -483,7 +498,7 @@ class StreamSource(StreamServer):
         pc = self.pc_host or local_ip_towards(self.scpi_ip or self.scope_ip)
         cmd = [self.python, script, self.scope_ip,
                "--pc-host", pc, "--pc-port", str(self.port),
-               "--channel", str(self.channel), "--format", self.fmt]
+               "--channel", str(self.channel)]
         if self.scpi_ip:
             cmd += ["--scpi-ip", self.scpi_ip]
         if self.drive_poll_ms:
@@ -496,9 +511,6 @@ class StreamSource(StreamServer):
             cmd += ["--sleep-const", spec]
         if self.drive_csv:
             cmd += ["--drive-csv", self.drive_csv]
-        if self.no_scpi_sleep:
-            cmd += ["--no-scpi-sleep",
-                    "--scpi-sleep-us", str(self.scpi_sleep_us)]
         self._tap_log = tempfile.NamedTemporaryFile(
             prefix="mho-tap-", suffix=".log", delete=False, mode="w+")
         self._proc = subprocess.Popen(cmd, stdout=self._tap_log,

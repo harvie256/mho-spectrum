@@ -57,8 +57,9 @@ about which is which matters more than the feature count.
   100% intercept, real-time bandwidth, or gap-free monitoring is false here, and any
   "density" number we compute is a statement about our own duty cycle, not the signal's.
   The duty cycle scales with record duration, not just point count: at 1 Mpt / 50 MSa/s
-  the record is 20 ms against a ~65 ms frame period, so ~31% observed and ~69% blind
-  (measured 2026-09-13). Better, still not gap-free. Anritsu's practice of showing POI and minimum-detectable-duration as live status
+  the record is 20 ms against a ~62 ms frame period, so ~32% observed and ~68% blind
+  (measured 2026-09-13, one channel; a second enabled channel roughly halves it).
+  Better, still not gap-free. Anritsu's practice of showing POI and minimum-detectable-duration as live status
   readouts is the right instinct; ours would read "≈75 ms" and should say so.
 - **No tuner, no mixer, no preselector.** The scope digitises baseband directly, so the
   analysable range is **DC to Nyquist** and nothing else. There is no RF centre frequency
@@ -76,8 +77,11 @@ about which is which matters more than the feature count.
   **SFDR is ~60 dB and no amount of averaging improves it**. A real analyser's step
   attenuator and preamp exist precisely to manage this trade, and our only equivalent
   lever is the scope's V/div.
-- **One channel at a time.** The tap fixes `:WAVeform:SOURce` at startup. Multi-channel
-  correlated views are possible but need tap-side work.
+- **Channels share the link.** The tap streams every enabled channel from the same
+  acquisition, interleaved, so N channels cost N× the bytes: CH1+CH2 at 1 Mpt is 8.7 fps
+  against 16.2 for one, capped by the ~35 MB/s USB link. Correlated views
+  (cross-spectrum, transfer function, coherence) are now arithmetic on data we have;
+  none is built yet.
 - **We hold the whole record, which is our unfair advantage.** 1 Mpt of raw samples per
   frame means gated FFT, zero-span/time-domain panes, digital down-conversion for narrow
   spans, re-windowing without re-acquiring, and Welch-style segmentation are all just
@@ -389,13 +393,13 @@ viewer into an instrument, and they are almost all `S`.
 
 | Feature | What it does | Vendor terminology / notes | Status | Effort | Value |
 |---|---|---|---|---|---|
-| Channel selection at runtime | Switch the analysed channel without restarting | Currently `--channel` at startup only; the tap fixes `:WAVeform:SOURce` at setup | Missing | M | High |
+| Channel selection at runtime | Switch the analysed channel without restarting | The tap streams whatever channels are enabled when it starts; changing them means restarting the tap (npts and buffers are sized at priming) | Missing | M | High |
 | Sample rate / timebase control | Set the scope's sample rate from the app, which sets Nyquist | Vendors' span control implies this; here it is a genuine acquisition change over SCPI. Also the lever for distinguishing real harmonics from interleave spurs — they move with fs, harmonics do not | Missing | M | High |
 | Memory depth / record length control | Set points per record, which sets RBW | R&S's "RBW controlled" mode does exactly this; it is what makes `RBW` a real setting rather than a readout | Missing | L | High |
 | Frame rate cap | Limit how often frames are processed, to leave CPU for other work | GQRX's `FFT Rate` 5–60 fps with a red dropped-frame indicator; SDRangel's FPS cap defaults to 20 with "NL" for unlimited | Partial | S | Low |
 | Dropped-frame annunciation | Show frames dropped, stale repeats, and source gap | Present in the status line and the timing strip, and better than any vendor's | Done | – | – |
 | Stale-record rejection | Never display a record the scope did not re-acquire | Payloads are CRC'd and byte-identical repeats are counted and discarded. No vendor needs this; we do, and it is already right | Done | – | – |
-| Multi-channel simultaneous analysis | Analyse two or more channels at once from the same acquisition | Keysight's MXR RTSA mode does per-channel centre frequencies over a shared span; Tektronix Spectrum View has a DDC per FlexChannel. Needs tap and protocol changes, and costs proportional bandwidth | Missing | L | Med |
+| Multi-channel simultaneous analysis | Analyse two or more channels at once from the same acquisition | Keysight's MXR RTSA mode does per-channel centre frequencies over a shared span; Tektronix Spectrum View has a DDC per FlexChannel. Ours: the tap sends every enabled channel from one acquisition, interleaved, and the plot overlays them (CH1+CH2 at 1 M: 8.7 fps, link-limited). Shared span only; markers, peaks and CSV still follow one channel, and there is one vertical scale per frame | Partial | M | Med |
 
 ---
 

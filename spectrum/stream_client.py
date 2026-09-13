@@ -42,6 +42,9 @@ class Frame:
     yinc: float = 0.0
     yorig: float = 0.0
     yref: float = 0.0
+    # Scope channel this record came from (1-4).  Frames of one acquisition
+    # share seq; get_group() returns them together.
+    channel: int = 1
 
     @property
     def npoints(self) -> int:
@@ -62,7 +65,7 @@ class StreamServer:
 
     def __init__(self, host: str = "0.0.0.0", port: int = DEFAULT_PORT):
         self.host, self.port = host, port
-        self._latest: Frame | None = None
+        self._latest: list[Frame] | None = None
         self._lock = threading.Lock()
         self._new = threading.Event()
         self._stop = threading.Event()
@@ -99,7 +102,12 @@ class StreamServer:
 
     # -- consumer ---------------------------------------------------------
     def get(self, timeout: float | None = None) -> Frame | None:
-        """Return the newest undelivered frame, or None on timeout."""
+        """Return the newest undelivered frame (its first channel), or None."""
+        group = self.get_group(timeout)
+        return group[0] if group else None
+
+    def get_group(self, timeout: float | None = None) -> list[Frame] | None:
+        """Return every channel of the newest undelivered acquisition, or None."""
         if not self._new.wait(timeout):
             return None
         with self._lock:
@@ -203,7 +211,7 @@ class StreamServer:
             if head is None:
                 return
             t_hdr = time.perf_counter()
-            magic, seq, npts, bps, _flags, _res, srate, _xi, _yi, _yo, _yr = \
+            magic, seq, npts, bps, flags, chmask, srate, _xi, _yi, _yo, _yr = \
                 struct.unpack(HDR_FMT, head)
             if magic != MAGIC:
                 raise ValueError(f"bad frame magic {magic!r} -- stream desynced")
@@ -223,13 +231,30 @@ class StreamServer:
                 self.repeats += 1
             self._last_crc = crc
 
+            # Several channels of one acquisition arrive as one frame, samples
+            # interleaved [a, b, a, b, ...] -- the layout the app's own export
+            # hands back.  flags (low nibble) is the channel count, reserved is
+            # the mask of which scope channels they are; both zero means one
+            # channel, CH1, which is also what an older tap sends.
+            nch = flags & 0xF if flags & 0xF > 1 else 1
+            if samples.size % nch:
+                raise ValueError(f"{samples.size} samples do not split into "
+                                 f"{nch} channels -- stream desynced")
+            chans = [c + 1 for c in range(8) if chmask >> c & 1]
+            if len(chans) != nch:
+                chans = list(range(1, nch + 1))
             now = time.perf_counter()
-            frame = Frame(seq=seq, samples=samples, sample_rate=srate,
-                          recv_time=now, yinc=_yi, yorig=_yo, yref=_yr)
+            # The header carries one vertical scale; per-channel scales are not
+            # sent yet, so absolute units are only right while the channels
+            # share a V/div.
+            group = [Frame(seq=seq, samples=samples[i::nch] if nch > 1 else samples,
+                           sample_rate=srate, recv_time=now, yinc=_yi,
+                           yorig=_yo, yref=_yr, channel=chans[i])
+                     for i in range(nch)]
             with self._lock:
                 if self._new.is_set():
                     self.dropped += 1      # consumer never picked up the last one
-                self._latest = frame
+                self._latest = group
                 self._new.set()
             self.frames += 1
             self.bytes += HDR + nbytes
