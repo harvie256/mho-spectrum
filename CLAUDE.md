@@ -52,6 +52,13 @@ its first real obstacle.
   elsewhere). Before that, 10 M shipped 1 Mpt fragments labelled 500 MSa/s: a
   1 MHz tone read as 10 MHz, at "6 fps, 12 MB/s". Check any depth work with
   `tests/acq_sweep.py --tone`; details in `docs/SCOPE_INTERNALS.md`.
+* **Fast timebases need the read held back, whatever the depth.** At 100 µs/div
+  the capture is idle ~1 ms after arming; a `:WAV:DATA?` sent then makes the
+  app wait ~2 s for a waveform that never comes, and the queued re-arms drain
+  as empty blocks — a 2.0–2.1 s stall. It is capture *time*, not points (1 k,
+  10 k, 1 M all did it). `libmhotap.c` holds the read until `SHORT_CAPTURE_US`
+  (20 ms) after the arm; measured 8 stalls/25 s at 0 ms, 1 at 10 ms, 0 at
+  20 ms, and 4–5 → 17 fps. Longer captures are already past it and pay nothing.
 * **Peak hold is applied after averaging**, in the same chain — it is
   max-hold-of-the-average, not an independent trace. Real trace modes
   (clear-write / max / min / average / view / blank as separate traces) are a

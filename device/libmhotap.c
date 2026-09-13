@@ -183,6 +183,7 @@ static struct {
     int          wait_record;      /* record spans several toWord calls */
     int          settle_us;        /* pinned delay before the read; 0 = adaptive */
     int          auto_settle_us, settle_hi_us, settle_lo_us;
+    int          last_settle_us;   /* delay actually applied, short captures too */
     int          good_run, fail_run;
     unsigned long recoveries;      /* fell back to settle_hi after a broken record */
     unsigned long incomplete;      /* cycles re-armed before the record completed */
@@ -258,6 +259,9 @@ static unsigned long record_begin(void) {
 #define SETTLE_MAX_US       2000000
 #define SETTLE_GOOD_RUN           3  /* whole records at hi before dropping to lo */
 #define SETTLE_FAIL_RUN           5  /* broken records at hi before doubling it */
+/* Earliest a read may follow the arm, for one-call records -- see driver_main.
+ * 20 ms is the lowest measured stall-free value at a 1 ms capture. */
+#define SHORT_CAPTURE_US      20000
 
 static void settle_adapt(int whole) {
     if (whole) {
@@ -371,6 +375,26 @@ armed:
          * 1 Mpt record is a single call and needs none of it.
          * mhotap_drive_settle() pins a fixed value instead. */
         int settle = D.settle_us > 0 ? D.settle_us : D.auto_settle_us;
+        /* A short capture wants a delay too, for a different reason.  At fast
+         * timebases the capture is idle ~1 ms after arming, and a :WAV:DATA?
+         * sent then often lands before the app has taken the record in.  The
+         * app then holds the query ~2 s waiting for a waveform that a stopped
+         * SINGLE never produces, every re-arm queues another behind it, and
+         * the backlog drains as zero-length blocks: a 2.0-2.1 s stall.  It
+         * follows the capture time, not the depth -- 1 k, 10 k and 1 M all
+         * stall at 100 us/div.  Measured at 100 us/div, 10 k, 25 s each
+         * (2026-09-13), delay after idle vs stalls over 1 s:
+         *
+         *   0 ms 8   2 ms 6   5 ms 8   10 ms 1   20 ms 0 (0 empty replies)
+         *
+         * So the read waits until SHORT_CAPTURE_US after arming.  A capture
+         * already that long pays nothing: 1 Mpt at 50 MSa/s is ~24 ms busy
+         * and ran stall-free with no delay. */
+        if (D.settle_us == 0 && !D.wait_record) {
+            int need = SHORT_CAPTURE_US - (int)((now_s() - t1) * 1e6);
+            if (need > settle) settle = need;
+        }
+        D.last_settle_us = settle > 0 ? settle : 0;
         if (settle > 0) usleep((useconds_t)settle);
         unsigned long done0 = record_begin();
         if (send_all(D.fd, req, strlen(req)) != 0) { D.trigger_errors++; break; }
@@ -468,7 +492,7 @@ void mhotap_drive_stats(double *out /* 13 doubles */) {
     out[8] = D.last_busy_ms;
     out[9] = (double)D.missed_busy;
     out[10] = (double)D.incomplete;
-    out[11] = (D.settle_us > 0 ? D.settle_us : D.auto_settle_us) / 1000.0;
+    out[11] = D.last_settle_us / 1000.0;
     out[12] = (double)D.recoveries;
 }
 
