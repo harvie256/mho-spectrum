@@ -9,7 +9,7 @@ Three interchangeable sources, all yielding the same Frame objects:
                    from proven parts (device/rigol_mho.py plus the speed
                    patch), so it cannot destabilise the app.
   StreamSource     the fast path: receives frames pushed by an on-scope tap.
-                   See fftdemo/stream_client.py.
+                   See spectrum/stream_client.py.
 """
 from __future__ import annotations
 
@@ -111,6 +111,12 @@ class SyntheticSource:
         3: ((4.0e6, 0.3), (1.0e6, 0.02)),
         4: ((9.0e6, 0.2), (1.0e6, 0.01)),
     }
+    # A vertical scale per channel, as the tap sends, so dBV/dBm and the
+    # per-channel scale can be exercised with no scope.  CH1's is the MHO934's
+    # own at 1 V/div (8 div over 60,000 codes, read 2026-09-13); the others are
+    # 0.5 / 0.2 / 0.1 V/div, so a scale applied to the wrong channel moves its
+    # trace visibly.  The signal is invented: the levels mean nothing else.
+    CHANNEL_YINC = {1: 1.3333e-4, 2: 6.6667e-5, 3: 2.6667e-5, 4: 1.3333e-5}
 
     def __init__(self, npoints=1_000_000, sample_rate=50e6,
                  tones=((1.0e6, 0.5), (3.0e6, 0.15), (7.25e6, 0.05)),
@@ -171,7 +177,8 @@ class SyntheticSource:
             loop_ms=(now - t_wait) * 1e3)
         self._last_arrival = now
         return [Frame(seq=self._seq, samples=codes[ch], sample_rate=self.sample_rate,
-                      recv_time=now, channel=ch) for ch in self.channels]
+                      recv_time=now, yinc=self.CHANNEL_YINC.get(ch, 0.0),
+                      yref=32768.0, channel=ch) for ch in self.channels]
 
     def stats(self):
         el = (time.perf_counter() - self._t0) if self._t0 else 0.0

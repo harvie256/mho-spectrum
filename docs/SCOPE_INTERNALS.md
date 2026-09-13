@@ -186,6 +186,67 @@ above, and in the two-channel frame CH2 peaks at 2.999999 MHz with a CH1/CH2
 correlation of 0.000 — the interleave is split correctly. The same settings on the SCPI
 loop gave 17 (with a 20 ms delay), 13–14.5, and 1.81 fps.
 
+### What the export interleaves: the *sampled* channels, in 1, 2 or 4 slots
+
+`ExportData` does not interleave the channels that are shown. Found 2026-09-13 when three
+channels on gave every "channel" the same mixture (a 1.7 MHz tone read at 13.775 MHz:
+four slots split by three), then traced through the app:
+
+* **What is sampled.** `CDrvSetting::GetSampleChanMask()` sets a bit for each channel
+  whose `CChannel::getOnOff()` is true (all four when Bode is on). That flag is separate
+  from `getShowOnOff()` (`GetVisibleChanMask`) and `getTrigOnOff()`
+  (`GetTriggerChanMask`): a trigger source that is not displayed is still sampled, which
+  is the scope's known behaviour of a hidden trigger channel still using ADC capacity.
+* **The slot count.** `CDrvSetting::GetChanCount(mask)` →
+  `DevSystem_GetSampleChanCount` → `DevSystem_GetSampleMode(mask)`, a table lookup giving
+  1, 2 or 4. `Drv_GetScope()->GetDrvParam(0)` (the `CDrvParam` at scope+0x5a00) holds the
+  count at +0x80 and the mask at +0x84, and `CDrvScope::ExportData` reads both there —
+  its count 7 times, for the range, the frame head and `SetTxInfo`.
+* **How the app picks a channel.** `CApiWave::getMemoryData`, under `:WAV:DATA?`, exports
+  `count ×` the requested range, then: count 1 → `memcpy`; count 2 or 4 → every 2nd or 4th
+  sample from slot `getChanNum(getChanSampleState())`, the requested channel's rank among
+  the "on" channels; any other count returns −3. There is no three-slot layout.
+
+Read live with the app's own getters while stepping the channel switches (Frida, read
+only), and checked against raw exports with CH1/CH2 on distinct tones and CH3/CH4 tagged
+by opposite DC offsets:
+
+```
+trigger CH1  shown 1          sampled 1          1 slot   CH1
+             shown 2 / 3 / 4  sampled 1+2/1+3/1+4 2 slots  CH1 CHn
+             shown 1+n        sampled 1+n        2 slots  CH1 CHn
+             shown 2+3 / 2+4 / 3+4, any three, all four   4 slots  CH1 CH2 CH3 CH4
+trigger CH2  shown 1          sampled 1+2        2 slots  CH1 CH2
+             shown 3          sampled 2+3        2 slots  CH2 CH3
+             shown 2          sampled 2          1 slot   CH2
+             shown 3+4        sampled 2+3+4      4 slots
+```
+
+With 4 slots the slots are CH1..CH4 by position whether or not a channel is sampled — an
+off CH4 still carries live data there. So a lone CH2 with the trigger on CH1 costs two
+channels' export, and CH2+CH3 costs four. The tap reads `GetDrvParam(0)`'s count and mask
+under `LockConfig` every capture (`layout_keep` in `device/libmhotap.c`), exports that
+many slots, drops the ones not being streamed before sending, and skips — and counts, as
+`skip=` in the stats line — any capture whose layout no longer holds every streamed
+channel. A rule fixed at startup was tried first and was wrong: the layout follows the
+trigger source, and the tap's own priming can change what is sampled.
+
+Checked live with that loop (2026-09-13, 2 ms/div, 1 M, USB gigabit): all 15 shown-channel
+combinations with the trigger on CH1 and six with it on CH2, every channel's content
+verified (tone frequency, or offset tag with a 60-code spread), 0 skips:
+
+```
+one channel, the trigger source     17.5 fps   1 slot
+one channel, trigger hidden         12.4–13.3  2 slots, keep 1
+any two                              8.8       2 or 4 slots
+any three                            5.85      4 slots
+all four                             4.39      4 slots
+```
+
+Dropping unwanted slots (`compact=`, last cycle only) read 6–13 ms for 2 → 1 and 17–34 ms
+for 4 → 2 or 3, where the startup-rule build had shown 4–8 ms; unexplained, and not yet the
+limit at two channels and up, where the link is.
+
 ### History: the SCPI-driven loop and its delays
 
 Until 2026-09-13 the tap made the app produce each record by sending `:WAV:DATA?` over

@@ -26,7 +26,7 @@ verified with no scope attached — use it.
 `docs/SPECTRUM_ANALYSER_FEATURES.md` is the plan: 199 features from real
 analysers (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, SDR tools),
 each scored Status / Effort / Value against this code, then a five-phase order.
-Currently 54 Done, 19 Partial, 111 Missing, 15 N/A on this hardware.
+Currently 54 Done, 20 Partial, 110 Missing, 15 N/A on this hardware.
 
 **Phase 1 is done** except the blind-time readout, which is not built. Phase 2
 (multiple traces, finishing absolute units, the measurement suite) is next; the
@@ -41,13 +41,21 @@ trace-mode restructure below is its first real obstacle.
   (measured: rect 1.00, hann 1.50, Blackman-Harris 2.00, flat-top 3.77). Both
   are shown in the annotation block, labelled differently on purpose —
   Keysight and Siglent both document conflating them as a classic error.
-* **Absolute units come from a scale queried once, at tap startup.**
-  `device/tap_stream.py` reads `:WAV:YINC?`/`YOR?`/`YREF?` over SCPI before
-  streaming and hands them to `mhotap_set_yscale()`; `libmhotap.c` writes them
-  at header offsets 40/48/56. Zero means unknown, and `analysis.unit_offset_db`
-  then leaves dBV/dBm reading as dBFS. So the scale goes stale if V/div changes
-  mid-session, and the `scpi` source (`ScpiSource`) never fills `yinc` at all —
-  it is dBFS-only. dBm assumes 50 Ω.
+* **Absolute units come from scales queried once, at tap startup — one per
+  channel.** `device/tap_stream.py` walks `:WAV:SOURce` over the enabled
+  channels reading `:WAV:YINC?`/`YOR?`/`YREF?`, then puts the source back. The
+  header carries one scale (offsets 40/48/56, `mhotap_set_yscale()`); with
+  several channels each one's follows the header as a table of three doubles
+  (`mhotap_set_yscale_ch()`, flagged `0x100` in the u16 at offset 18 whose low
+  nibble is the channel count). Each channel has its own V/div, so the window
+  shifts each spectrum by its own offset: CH2 at 2 V/div beside CH1 at 1 V/div
+  read within 0.01 dB of the scope's Vrms (2026-09-13). Zero means unknown,
+  `analysis.unit_offset_db` then leaves dBV/dBm reading as dBFS, and the window
+  refuses dBV unless every channel has a scale. The scales go stale if V/div
+  changes mid-session, and the `scpi` source (`ScpiSource`) never fills `yinc` —
+  it is dBFS-only. The synthetic source sends invented per-channel scales
+  (1 / 0.5 / 0.2 / 0.1 V/div) so the units path runs with no scope. dBm assumes
+  50 Ω.
 * **The tap is sequenced on the app's own event and lock — never fix a race
   on it with a delay.** `libmhotap.c`'s capture loop arms SINGLE, waits for
   `CDrvScope::ReadNormTrace` to return 0 (a return hook in `mho_tap.js`), takes
@@ -64,14 +72,23 @@ trace-mode restructure below is its first real obstacle.
   19.9 at 100 µs/div 10 k, 14.3 at 1 GSa/s, 1.72 at 10 M (the link). Check depth
   or rate work with `tests/acq_sweep.py --tone`; timelines in
   `docs/SCOPE_INTERNALS.md`.
-* **Every enabled channel is streamed, interleaved, whether you look at it or
-  not.** `ExportData` returns `[CH1, CH2, CH1, CH2, …]` for all channels switched
-  on, so enabling a second one doubles the bytes: CH1+CH2 at 1 M runs 8.7 fps,
-  capped by the ~35 MB/s USB link (the loop itself does ~10 captures/s and drops
-  the rest on the scope). The header carries the count (offset 18) and a channel
-  mask (offset 20); `StreamServer` splits the frame and `get_group()` returns one
-  `Frame` per channel. There is one vertical scale per frame, so dBV/dBm are
-  only right while the channels share a V/div.
+* **The export interleaves the channels the app *samples*, not the ones shown,
+  in 1, 2 or 4 slots — so the tap reads that layout from the app every
+  capture.** A trigger source that isn't displayed is still sampled: with the
+  trigger on CH1, a lone CH2 exports CH1+CH2, and three or more sampled channels
+  export all four slots, CH1..CH4 by position, off ones included.
+  `libmhotap.c` reads `GetDrvParam(0)`'s count and mask under `LockConfig`
+  (`layout_keep`), drops the slots not being streamed, and skips — `skip=` in
+  the stats line — any capture whose layout lost a streamed channel. Never size
+  or split by the shown count: with three channels that mixed every channel
+  into every other. Every displayed channel is streamed; the header carries
+  their count (offset 18) and mask (offset 20), and `StreamServer` splits the
+  frame into one `Frame` per channel. Measured 2026-09-13, 2 ms/div 1 M, USB
+  gigabit, all 15 combinations plus trigger-on-CH2 checked channel by channel:
+  one channel 17.5 fps when it is the trigger source, 12.4–13.3 when the
+  trigger is a hidden channel (two slots exported); any two 8.8, three 5.85,
+  four 4.39 — the ~35 MB/s link caps two and up. Trigger on a displayed channel
+  for full single-channel speed. Map and disassembly: `docs/SCOPE_INTERNALS.md`.
 * **Peak hold is applied after averaging**, in the same chain — it is
   max-hold-of-the-average, not an independent trace. Real trace modes
   (clear-write / max / min / average / view / blank as separate traces) are a
@@ -93,7 +110,7 @@ trace-mode restructure below is its first real obstacle.
 `spectrum/fft_gui.py` is argparse plus the headless harness; the window lives in
 `window.py`, and under it: `viewmodel.py` (FreqView/AmpScale — the axis
 arithmetic, deliberately Qt-free and the place to test it), `panels.py` (the
-FREQ/AMPT/BW/MARKER/VIEW control groups, each emitting signals and holding no
+FREQ/AMPT/BW/TRACE/MARKER/VIEW control groups, each emitting signals and holding no
 reference to the engine), `plots.py` (spectrum pane and timing strip),
 `markers.py`, `analysis.py` (peak search, spur frequencies, CSV), and
 `channels.py` (`ChannelEngines`: one `SpectrumEngine` per channel with
@@ -101,10 +118,16 @@ reference to the engine), `plots.py` (spectrum pane and timing strip),
 
 Channels are an *input*, not a trace. The window processes each acquisition as
 a group (`self.frames` / `self.spectra`) and the plot overlays every channel
-in the scope's colours, but peaks, markers, zoom-to-signal and the annotation
-block still follow one active channel (`self.active_ch`, the first). When real
+in the scope's colours. What needs one spectrum — peak search and the peak
+table, zoom to signal, the annotation block, new markers, the peaks CSV —
+follows the active channel (`self.active_ch`), chosen in the TRACE tab and drawn
+on top. Markers carry a `channel` and each reads its own channel's trace, so a
+delta between markers on two channels is CH2 − CH1 at one frequency; marker
+gestures move the selected marker onto the active channel. Hiding a channel
+stops its drawing and hides its markers but not its averaging (the roadmap's
+Blank). The trace CSV writes every channel, one power column each. When real
 trace modes arrive, a trace should be (channel, mode) over `ChannelEngines`.
-`./run_fft.sh synthetic --synthetic-channels 2` exercises all of it.
+`./run_fft.sh synthetic --synthetic-channels 4` exercises all of it.
 
 `window.py` owns the frame loop and the per-frame instrumentation, which is
 what catches a new feature's cost — that is how the peak search's 12–17 ms was
@@ -138,11 +161,14 @@ loop and needs re-measuring against the export loop before it is turned back
 on. See `--no-tap-quiet-ui`, `--tap-keep-logd` and `--tap-keep-adc-sleep`.
 
 The loop's stats line (`arm= rnt= lock= export= cycle= armTO= expErr=`) splits
-each cycle by phase; `tests/acq_sweep.py` parses it (`RE_TAPSTAT`), so change
-the two together. Probing the live scope has side effects worth avoiding:
-`:MEASure:ITEM?` switches that measurement on (clear with `:MEASure:CLEar`),
-and `:ACQuire:MDEPth` only takes while running — restore and read back any
-setting a test touches.
+each cycle by phase, followed by the app's export layout and what it cost
+(`slots=count:channels skip= compact=`); `tests/acq_sweep.py` parses both
+(`RE_TAPSTAT`, `RE_SLOTS`/`RE_SKIP`), so change them together. Probing the live scope has side effects worth avoiding:
+any `:MEASure` query switches that measurement on, so take levels and
+frequencies from captured frames instead; if one did get switched on, clear with
+`:MEASure:CLEar` — `:MEASure:CLEar ALL` is rejected (`-108`) and clears nothing.
+`:ACQuire:MDEPth` only takes while running. Restore and read back any setting a
+test touches, and drain `:SYSTem:ERRor?` (`Scope.errors()`) afterwards.
 
 Rebuilding the tap needs the NDK: `ANDROID_NDK=... device/build_tap.sh`.
 

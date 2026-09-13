@@ -18,6 +18,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from analysis import AMP_UNITS, DBM_OHMS
+from plots import CHANNEL_COLOURS
 from spectrum import DETECTORS, WINDOWS
 
 _SUFFIXES = {"": 1.0, "h": 1.0, "k": 1e3, "khz": 1e3, "m": 1e6, "mhz": 1e6,
@@ -275,6 +276,91 @@ class BwPanel(QtWidgets.QWidget):
         self.reset_btn.clicked.connect(self.reset.emit)
 
 
+class TracePanel(QtWidgets.QWidget):
+    """Which channels are drawn, and which one the readouts follow.
+
+    Channels are inputs, not traces (channels.py): every one is processed,
+    averaged and overlaid.  What cannot be overlaid is a readout -- peak
+    search, the peak table, zoom to signal, the annotation block, new markers
+    and the peaks CSV each need one spectrum -- so they follow the *active*
+    channel chosen here.  Hiding a channel stops it being drawn but not
+    averaged, as a bench analyser's Blank does.  Real trace modes, when they
+    arrive, belong in this tab too.
+    """
+
+    active_changed = QtCore.Signal(int)
+    visibility_changed = QtCore.Signal(int, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.active_box = QtWidgets.QComboBox()
+        self.active_box.setToolTip(
+            "Peak search, the peak table, zoom to signal, new markers, the "
+            "annotation block and the peaks CSV use this channel. Marker "
+            "gestures move a marker onto it: select a marker on one channel, "
+            "make another active and press delta to read the difference "
+            "between them at one frequency.")
+        self._checks: dict[int, QtWidgets.QCheckBox] = {}
+        self._check_row = QtWidgets.QWidget()
+        self._check_lay = QtWidgets.QHBoxLayout(self._check_row)
+        self._check_lay.setContentsMargins(0, 0, 0, 0)
+        self._check_lay.setSpacing(12)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(_row("active channel", self.active_box))
+        lay.addWidget(_row("show", self._check_row,
+                           QtWidgets.QLabel("   a hidden channel keeps "
+                                            "averaging")))
+        self.active_box.currentIndexChanged.connect(self._on_active)
+
+    def _on_active(self, _i):
+        ch = self.active_box.currentData()
+        if ch is not None:
+            self.active_changed.emit(int(ch))
+
+    def set_channels(self, channels, active: int | None, hidden=()):
+        """Rebuild for the source's channel set, without emitting."""
+        self.active_box.blockSignals(True)
+        self.active_box.clear()
+        for ch in channels:
+            self.active_box.addItem(f"CH{ch}", ch)
+        self.active_box.blockSignals(False)
+        self.show_active(active)
+        for chk in self._checks.values():
+            self._check_lay.removeWidget(chk)
+            chk.deleteLater()
+        self._checks = {}
+        for ch in channels:
+            chk = QtWidgets.QCheckBox(f"CH{ch}")
+            chk.setChecked(ch not in hidden)
+            chk.setStyleSheet(f"color: {CHANNEL_COLOURS.get(ch, '#c0c0c0')};")
+            chk.toggled.connect(lambda on, c=ch: self.visibility_changed.emit(c, on))
+            self._check_lay.addWidget(chk)
+            self._checks[ch] = chk
+        # One channel has nothing to choose between or hide.
+        multi = len(channels) > 1
+        self.active_box.setEnabled(multi)
+        for chk in self._checks.values():
+            chk.setEnabled(multi)
+
+    def show_active(self, ch: int | None):
+        """Follow the model without re-emitting."""
+        i = self.active_box.findData(ch)
+        if i >= 0:
+            self.active_box.blockSignals(True)
+            self.active_box.setCurrentIndex(i)
+            self.active_box.blockSignals(False)
+
+    def show_visible(self, ch: int, on: bool):
+        chk = self._checks.get(ch)
+        if chk is not None:
+            chk.blockSignals(True)
+            chk.setChecked(on)
+            chk.blockSignals(False)
+
+
 class MarkerPanel(QtWidgets.QWidget):
     """Marker placement and the peak-search family.
 
@@ -344,6 +430,8 @@ class MarkerPanel(QtWidgets.QWidget):
         self.to_cf_btn.clicked.connect(self.marker_to_centre.emit)
         self.clear_btn.clicked.connect(self.clear.emit)
         self.thresh.valueChanged.connect(lambda *_: self.criteria_changed.emit())
+        self.excursion.valueChanged.connect(lambda *_: self.criteria_changed.emit())
+        self.auto_thresh.toggled.connect(lambda *_: self.criteria_changed.emit())
 
     def set_unit(self, unit: str, delta_db: float):
         """Relabel the threshold, and move a manual one with the trace.
@@ -356,8 +444,6 @@ class MarkerPanel(QtWidgets.QWidget):
             self.thresh.blockSignals(True)
             self.thresh.setValue(self.thresh.value() + delta_db)
             self.thresh.blockSignals(False)
-        self.excursion.valueChanged.connect(lambda *_: self.criteria_changed.emit())
-        self.auto_thresh.toggled.connect(lambda *_: self.criteria_changed.emit())
 
 
 class ViewPanel(QtWidgets.QWidget):
@@ -414,6 +500,9 @@ class ViewPanel(QtWidgets.QWidget):
             "delivered power, and is wrong if the input is not so terminated.")
         self.shot_btn = QtWidgets.QPushButton("screenshot")
         self.trace_btn = QtWidgets.QPushButton("export trace CSV")
+        self.trace_btn.setToolTip(
+            "Full resolution. With several channels, one power column per "
+            "channel -- hidden ones included -- beside one frequency column.")
         self.peaks_btn = QtWidgets.QPushButton("export peaks CSV")
 
         lay = QtWidgets.QVBoxLayout(self)
@@ -448,8 +537,15 @@ class TablePane(QtWidgets.QTabWidget):
 
     def __init__(self):
         super().__init__()
-        self.markers = self._table(("#", "type", "frequency", "level"))
+        self.markers = self._table(("#", "ch", "type", "frequency", "level"))
         self.peaks = self._table(("#", "frequency", "level", "Δf", "Δ level"))
+        # ch and type are short fixed words.  Given an equal share of a 330 px
+        # pane, as the other columns are, they squeezed the frequency header to
+        # "REQUENC" and cut the level's unit off.
+        for col in (1, 2):
+            self.markers.horizontalHeader().setSectionResizeMode(
+                col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.set_multi(False)
         self.set_unit("dBFS")
         self.addTab(self.markers, "markers")
         self.addTab(self.peaks, "peaks")
@@ -496,12 +592,17 @@ class TablePane(QtWidgets.QTabWidget):
         self.peaks.setHorizontalHeaderLabels(
             ["#", "frequency", f"level ({unit})", "Δf vs #1", "Δ level vs #1"])
 
+    def set_multi(self, on: bool):
+        """The ch column only says anything with more than one channel."""
+        self.markers.setColumnHidden(1, not on)
+
     def show_markers(self, rows):
         self._fill(self.markers, rows)
         self.setTabText(0, f"markers ({len(rows)})" if rows else "markers")
 
-    def show_peaks(self, peaks, offset: float = 0.0):
-        from analysis import AMP_UNITS, DBM_OHMS, format_hz
+    def show_peaks(self, peaks, offset: float = 0.0, channel: int | None = None):
+        """`channel` names whose peaks these are; None with a single channel."""
+        from analysis import format_hz
         self._peak_freqs = [p.freq for p in peaks]
         ref = peaks[0] if peaks else None
         rows = []
@@ -512,7 +613,8 @@ class TablePane(QtWidgets.QTabWidget):
                          if i > 1 else "—",
                          f"{dl:+.2f}" if i > 1 else "—"))
         self._fill(self.peaks, rows)
-        self.setTabText(1, f"peaks ({len(rows)})" if rows else "peaks")
+        name = f"peaks CH{channel}" if channel is not None else "peaks"
+        self.setTabText(1, f"{name} ({len(rows)})" if rows else name)
 
     def _on_peak_click(self, row: int, _col: int):
         if 0 <= row < len(self._peak_freqs):

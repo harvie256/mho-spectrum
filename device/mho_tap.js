@@ -51,12 +51,15 @@ function loadTap(soPath) {
     fn.close = new NativeFunction(resolve(m, 'mhotap_close'), 'void', []);
     fn.yscale = new NativeFunction(resolve(m, 'mhotap_set_yscale'),
                                    'void', ['double', 'double', 'double']);
+    fn.yscaleCh = new NativeFunction(resolve(m, 'mhotap_set_yscale_ch'),
+                                     'void', ['int', 'double', 'double', 'double']);
     fn.rate = new NativeFunction(resolve(m, 'mhotap_set_rate'), 'void', ['double']);
     fn.record = new NativeFunction(resolve(m, 'mhotap_set_record'), 'void', ['long']);
     fn.channels = new NativeFunction(resolve(m, 'mhotap_set_channels'),
                                      'void', ['int', 'uint']);
     fn.exportSetup = new NativeFunction(resolve(m, 'mhotap_export_setup'),
                                         'void', ['pointer', 'pointer', 'pointer',
+                                                 'pointer', 'pointer', 'pointer',
                                                  'pointer', 'pointer', 'pointer']);
     fn.rntDone = new NativeFunction(resolve(m, 'mhotap_rnt_done'), 'void', ['int']);
     fn.driveStart = new NativeFunction(resolve(m, 'mhotap_drive_start'),
@@ -76,6 +79,23 @@ var plotListener = null;
 var plotFns = null;
 var patched_sites = [];              /* movz/movk immediates we rewrote */
 
+var pfns = null;
+function paramFns() {
+    if (!pfns) {
+        pfns = {
+            scope: new NativeFunction(mod.getExportByName('_Z12Drv_GetScopev'),
+                                      'pointer', []),
+            get: new NativeFunction(mod.getExportByName('_ZN9CDrvScope11GetDrvParamEj'),
+                                    'pointer', ['pointer', 'uint']),
+            count: new NativeFunction(mod.getExportByName('_ZN9CDrvParam12GetChanCountEv'),
+                                      'uint', ['pointer']),
+            mask: new NativeFunction(mod.getExportByName('_ZN9CDrvParam11GetChanMaskEv'),
+                                     'uint', ['pointer'])
+        };
+    }
+    return pfns;
+}
+
 function readDoubles(buf, n) {
     var o = [];
     for (var i = 0; i < n; i++) o.push(buf.add(i * 8).readDouble());
@@ -94,10 +114,23 @@ rpc.exports = {
         return { ok: true };
     },
     setRate: function (srate) { fn.rate(srate); return true; },
+    /* What ExportData would interleave right now: CDrvParam's slot count
+     * (1, 2 or 4) and sampled-channel mask on Drv_GetScope()->GetDrvParam(0).
+     * Read here only to size buffers at startup; the capture loop reads the
+     * same getters under LockConfig every cycle. */
+    layout: function () {
+        var p = paramFns().get(paramFns().scope(), 0);
+        return { count: paramFns().count(p), mask: paramFns().mask(p) };
+    },
     /* volts = (code - yref) * yinc + yorig.  Without it the receiver has no
      * way to label the axis in anything but dBFS. */
     setYScale: function (yinc, yorig, yref) {
         fn.yscale(yinc, yorig, yref); return true;
+    },
+    /* The same for one channel, i = its place in the interleave.  With several
+     * channels these go out as a table after the header. */
+    setYScaleCh: function (i, yinc, yorig, yref) {
+        fn.yscaleCh(i | 0, yinc, yorig, yref); return true;
     },
     stats: function () {
         if (!statsBuf) statsBuf = Memory.alloc(8 * 8);
@@ -119,7 +152,10 @@ rpc.exports = {
                        mod.getExportByName('_Z22DrvWaveform_ExportBackv'),
                        mod.getExportByName('_Z12Drv_GetScopev'),
                        mod.getExportByName('_ZN9CDrvScope10LockConfigEv'),
-                       mod.getExportByName('_ZN9CDrvScope12UnlockConfigEv'));
+                       mod.getExportByName('_ZN9CDrvScope12UnlockConfigEv'),
+                       mod.getExportByName('_ZN9CDrvScope11GetDrvParamEj'),
+                       mod.getExportByName('_ZN9CDrvParam12GetChanCountEv'),
+                       mod.getExportByName('_ZN9CDrvParam11GetChanMaskEv'));
         if (!rntListener) {
             rntListener = Interceptor.attach(
                 mod.getExportByName('_ZN9CDrvScope13ReadNormTraceEi'), {
@@ -130,12 +166,13 @@ rpc.exports = {
     },
     driveStop: function () { fn.driveStop(); return true; },
     driveStats: function () {
-        if (!driveBuf) driveBuf = Memory.alloc(8 * 8);
+        if (!driveBuf) driveBuf = Memory.alloc(12 * 8);
         fn.driveStats(driveBuf);
-        var o = readDoubles(driveBuf, 8);
+        var o = readDoubles(driveBuf, 12);
         return { cycles: o[0], arm_timeouts: o[1], export_errors: o[2],
                  arm_ms: o[3], rnt_wait_ms: o[4], lock_wait_ms: o[5],
-                 export_ms: o[6], cycle_ms: o[7] };
+                 export_ms: o[6], cycle_ms: o[7], compact_ms: o[8],
+                 layout_skips: o[9], slots: o[10], slot_mask: o[11] };
     },
     /* --- the scope's own waveform redraw -------------------------------
      * CApiPlotWave::doRender() opens with `if (!getEnalbe()) { usleep(50000);

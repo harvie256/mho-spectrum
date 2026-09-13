@@ -193,13 +193,53 @@ def write_trace_csv(path: str, spec, reduced: tuple[np.ndarray, np.ndarray] | No
     return int(len(f))
 
 
+def write_traces_csv(path: str, spectra: dict, yinc: dict | None = None,
+                     unit: str = "dBFS") -> int:
+    """Several channels' traces in one file: one frequency column, then a
+    power column per channel, at full resolution.
+
+    A shared frequency column is only honest because the channels come from one
+    acquisition -- same record length and sample rate, so the same bins.  That
+    is checked rather than assumed: a file whose columns quietly belonged to
+    different bins would be worse than no file.  Each channel's volts-per-code
+    goes in the header, aligned with its column, because each column was
+    converted to `unit` with its own.
+    """
+    chans = sorted(spectra)
+    first = spectra[chans[0]]
+    for ch in chans[1:]:
+        s = spectra[ch]
+        if s.n != first.n or s.sample_rate != first.sample_rate:
+            raise ValueError(
+                f"CH{ch} is {s.n} pts at {s.sample_rate:g} Sa/s but CH{chans[0]} "
+                f"is {first.n} at {first.sample_rate:g}: not one acquisition")
+    yinc = yinc or {}
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["# window", first.window, "points", first.n,
+                    "sample_rate_Hz", f"{first.sample_rate:.6g}"])
+        w.writerow(["# bin_spacing_Hz", f"{first.resolution:.6g}",
+                    "rbw_Hz", f"{first.rbw:.6g}",
+                    "enbw_bins", f"{first.enbw_bins:.6g}"])
+        w.writerow(["# yinc_V_per_code"] + [f"{yinc.get(ch, 0.0):.6g}" for ch in chans])
+        w.writerow(["frequency_Hz"] + [f"power_CH{ch}_{unit}" for ch in chans])
+        # savetxt rather than a csv row loop: 500k rows x 5 columns is several
+        # seconds through the csv module.  \r\n to match the rows above, which
+        # is what csv.writer ends lines with.
+        cols = np.column_stack([first.freqs] + [spectra[ch].power_db for ch in chans])
+        np.savetxt(fh, cols, delimiter=",", newline="\r\n",
+                   fmt=["%.6f"] + ["%.4f"] * len(chans))
+    return int(first.freqs.size)
+
+
 def write_peaks_csv(path: str, peaks: list[Peak], spec, offset: float = 0.0,
-                    unit: str = "dBFS") -> int:
+                    unit: str = "dBFS", channel: int | None = None) -> int:
     """Write the peak table, with the delta columns an analyser shows."""
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["# rbw_Hz", f"{spec.rbw:.6g}", "window", spec.window,
-                    "sample_rate_Hz", f"{spec.sample_rate:.6g}"])
+                    "sample_rate_Hz", f"{spec.sample_rate:.6g}"]
+                   + (["channel", f"CH{channel}"] if channel is not None else []))
         w.writerow(["n", "frequency_Hz", f"level_{unit}",
                     "delta_freq_Hz", "delta_level_dB"])
         ref = peaks[0] if peaks else None

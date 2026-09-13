@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Receive waveform frames streamed from the scope.
 
-The on-scope tap (stream/mho_stream.js) connects out to us and pushes a fixed
-64-byte header followed by the raw record, so there is no parsing to do beyond
-unpacking the header.
+The on-scope tap (device/libmhotap.c) connects out to us and pushes a fixed
+64-byte header -- with several channels, a per-channel scale table after it --
+followed by the raw record, so there is no parsing to do beyond unpacking them.
 
 Run standalone as a throughput sink:
-    python3 fftdemo/stream_client.py --sink
+    python3 spectrum/stream_client.py --sink
 """
 from __future__ import annotations
 
@@ -27,6 +27,11 @@ MAGIC = b"MHOFRAME"
 HDR = 64
 HDR_FMT = "<8sIIHHI5d"          # magic, seq, npoints, bps, flags, reserved, 5 doubles
 assert struct.calcsize(HDR_FMT) == HDR, struct.calcsize(HDR_FMT)
+# flags bit: (yinc, yorig, yref) per channel follows the header, in interleave
+# order.  libmhotap.c HDR_FLAG_SCALES; change the two together.
+FLAG_SCALES = 0x100
+SCALE_FMT = "<3d"
+SCALE_BYTES = struct.calcsize(SCALE_FMT)
 
 DEFAULT_PORT = 5560
 
@@ -218,6 +223,24 @@ class StreamServer:
             if bps not in (1, 2) or not (0 < npts <= 1 << 28):
                 raise ValueError(f"implausible frame header: {npts} pts x {bps} B")
 
+            # Several channels of one acquisition arrive as one frame, samples
+            # interleaved [a, b, a, b, ...] -- the layout the app's own export
+            # hands back.  flags (low nibble) is the channel count, reserved is
+            # the mask of which scope channels they are; both zero means one
+            # channel, CH1, which is also what an older tap sends.
+            nch = flags & 0xF if flags & 0xF > 1 else 1
+            scales = [(_yi, _yo, _yr)] * nch
+            table = 0
+            if flags & FLAG_SCALES:
+                # Each channel's own vertical scale: they have their own V/div,
+                # so the header's single scale would be right for one of them.
+                table = nch * SCALE_BYTES
+                raw = self._recv_exact(conn, table, self._stop)
+                if raw is None:
+                    return
+                scales = [struct.unpack_from(SCALE_FMT, raw, i * SCALE_BYTES)
+                          for i in range(nch)]
+
             nbytes = npts * bps
             payload = self._recv_exact(conn, nbytes, self._stop)
             if payload is None:
@@ -231,12 +254,6 @@ class StreamServer:
                 self.repeats += 1
             self._last_crc = crc
 
-            # Several channels of one acquisition arrive as one frame, samples
-            # interleaved [a, b, a, b, ...] -- the layout the app's own export
-            # hands back.  flags (low nibble) is the channel count, reserved is
-            # the mask of which scope channels they are; both zero means one
-            # channel, CH1, which is also what an older tap sends.
-            nch = flags & 0xF if flags & 0xF > 1 else 1
             if samples.size % nch:
                 raise ValueError(f"{samples.size} samples do not split into "
                                  f"{nch} channels -- stream desynced")
@@ -244,12 +261,9 @@ class StreamServer:
             if len(chans) != nch:
                 chans = list(range(1, nch + 1))
             now = time.perf_counter()
-            # The header carries one vertical scale; per-channel scales are not
-            # sent yet, so absolute units are only right while the channels
-            # share a V/div.
             group = [Frame(seq=seq, samples=samples[i::nch] if nch > 1 else samples,
-                           sample_rate=srate, recv_time=now, yinc=_yi,
-                           yorig=_yo, yref=_yr, channel=chans[i])
+                           sample_rate=srate, recv_time=now, yinc=scales[i][0],
+                           yorig=scales[i][1], yref=scales[i][2], channel=chans[i])
                      for i in range(nch)]
             with self._lock:
                 if self._new.is_set():
@@ -257,9 +271,9 @@ class StreamServer:
                 self._latest = group
                 self._new.set()
             self.frames += 1
-            self.bytes += HDR + nbytes
+            self.bytes += HDR + table + nbytes
             with self._lock:
-                self._rate_hist.append((now, HDR + nbytes))
+                self._rate_hist.append((now, HDR + table + nbytes))
             self.timing.record(
                 t=now,
                 arr_gap_ms=((now - self._last_arrival) * 1e3

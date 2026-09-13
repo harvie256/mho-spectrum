@@ -47,13 +47,16 @@ def on_msg(m, _d):
             print(" ", p)
 
 
+def mask_str(mask: int) -> str:
+    return "+".join(f"CH{c + 1}" for c in range(4) if mask >> c & 1) or "none"
+
+
 def setup_readout(sc: Scope, channel: int):
     """Prime a deep-memory acquisition and read what the loop needs to know.
 
-    Returns (points per channel, sample rate, vertical scale of `channel`,
+    Returns (points per channel, sample rate, {channel: (yinc, yorig, yref)},
     enabled channels).  The export reads every *enabled* channel regardless of
-    :WAV:SOURce; `channel` is only switched on, used to check the record, and
-    used for the vertical scale.
+    :WAV:SOURce; `channel` is only switched on and used to check the record.
     """
     sc.write(":STOP"); sc.opc()
     sc.write(f":CHANnel{channel}:DISPlay ON")
@@ -77,23 +80,29 @@ def setup_readout(sc: Scope, channel: int):
     srate = float(sc.query(":ACQuire:SRATe?"))
     channels = [c for c in (1, 2, 3, 4)
                 if sc.query(f":CHANnel{c}:DISPlay?").strip() == "1"]
-    # The vertical scale, so the receiver can offer dBV/dBm instead of only
-    # dBFS.  Queried once here rather than per frame: it only changes when the
-    # V/div does, and the loop never talks SCPI.  Any failure leaves it at
-    # zero, which the receiver reads as "unknown".
-    yinc = yorig = yref = 0.0
-    try:
-        yinc = float(sc.query(":WAVeform:YINCrement?"))
-        yorig = float(sc.query(":WAVeform:YORigin?"))
-        yref = float(sc.query(":WAVeform:YREFerence?"))
-    except Exception as e:
-        adbutil.log(f"no vertical scale ({e}); the display stays in dBFS")
-    if len(channels) > 1:
-        scales = {c: sc.query(f":CHANnel{c}:SCALe?").strip() for c in channels}
-        if len({float(v) for v in scales.values()}) > 1:
-            adbutil.log(f"channels differ in V/div ({scales}); absolute units "
-                        f"are CH{channel}'s and only right for it")
-    return npts, srate, (yinc, yorig, yref), channels
+    # Each channel's vertical scale, so the receiver can offer dBV/dBm instead
+    # of only dBFS.  Per channel, because each has its own V/div and the export
+    # is raw codes for all of them; :WAV:YINC? answers for the current
+    # :WAV:SOURce, so walk the source over the enabled channels and put it
+    # back.  Queried once here rather than per frame -- the loop never talks
+    # SCPI -- so a V/div changed mid-session goes stale (docs/NEXT_WORK.md,
+    # item 1).  A failure leaves that channel at zero, which the receiver
+    # reads as "unknown".
+    scales = {}
+    for c in channels:
+        try:
+            sc.write(f":WAVeform:SOURce CHANnel{c}")
+            got = sc.query(":WAVeform:SOURce?")
+            if str(c) not in got:
+                raise RuntimeError(f"source stayed {got.strip()!r}")
+            scales[c] = (float(sc.query(":WAVeform:YINCrement?")),
+                         float(sc.query(":WAVeform:YORigin?")),
+                         float(sc.query(":WAVeform:YREFerence?")))
+        except Exception as e:
+            adbutil.log(f"no vertical scale for CH{c} ({e}); it stays in dBFS")
+            scales[c] = (0.0, 0.0, 0.0)
+    sc.write(f":WAVeform:SOURce CHANnel{channel}")
+    return npts, srate, scales, channels
 
 
 def main():
@@ -193,7 +202,7 @@ def main():
     adbutil.log(f"libmhotap.so loaded at {base}")
 
     sc = Scope(host=scpi_ip, timeout=30.0)
-    npts, srate, yscale, channels = setup_readout(sc, args.channel)
+    npts, srate, scales, channels = setup_readout(sc, args.channel)
     nch = len(channels)
     mask = sum(1 << (c - 1) for c in channels)
     frame_bytes = npts * 2 * nch
@@ -202,18 +211,37 @@ def main():
                 f"@ {srate/1e6:.0f} MSa/s")
     adbutil.log(f"channels: {'+'.join(f'CH{c}' for c in channels)}, "
                 f"interleaved ({frame_bytes} B/frame)")
+    # The export is what the app *samples* -- the shown channels plus a hidden
+    # trigger source -- in 1, 2 or 4 slots, and can be wider than what is sent
+    # (libmhotap.c layout_keep).  The loop reads the layout itself every
+    # capture; this only sizes the buffers, with room for 4 slots where that
+    # stays under 32 MB a buffer, so a layout that widens mid-session is still
+    # exported rather than skipped.
+    lay = tap.exports_sync.layout()
+    slots = max(1, int(lay["count"]))
+    cap_slots = 4 if npts * 2 * 4 <= 32_000_000 else max(slots, nch)
+    adbutil.log(f"app samples {mask_str(int(lay['mask']))} in {slots} slot(s); "
+                f"buffers sized for {cap_slots}")
 
-    r = tap.exports_sync.start(args.pc_host, args.pc_port, frame_bytes + 4096,
+    r = tap.exports_sync.start(args.pc_host, args.pc_port,
+                               npts * 2 * cap_slots + 4096,
                                srate, frame_bytes, nch, mask)
     if not r.get("ok"):
         session.detach()
         raise SystemExit(f"tap start failed rc={r.get('rc')} -- is the PC "
                          f"receiver listening on {args.pc_host}:{args.pc_port}?")
     adbutil.log(f"tap streaming to {args.pc_host}:{args.pc_port}")
-    if yscale[0]:
-        tap.exports_sync.set_y_scale(*yscale)
-        adbutil.log(f"vertical scale: {yscale[0]:.6g} V/code, origin {yscale[1]:g}, "
-                    f"ref {yscale[2]:g}")
+    # The header's own scale is all a one-channel frame needs; with several,
+    # every channel's goes in the table after it, in interleave order.
+    if scales[args.channel][0]:
+        tap.exports_sync.set_y_scale(*scales[args.channel])
+    if nch > 1:
+        for i, c in enumerate(channels):
+            tap.exports_sync.set_y_scale_ch(i, *scales[c])
+    for c in channels:
+        yi, yo, yr = scales[c]
+        adbutil.log(f"CH{c} vertical scale: {yi:.6g} V/code, origin {yo:g}, "
+                    f"ref {yr:g}" if yi else f"CH{c} vertical scale unknown")
 
     # The whole frame loop runs on the scope: arm, wait for the app to read
     # the capture, export, send.  No per-frame RPC and no SCPI.
@@ -344,6 +372,10 @@ def main():
                             f"cycle={dv['cycle_ms']:.0f}ms "
                             f"armTO={int(dv['arm_timeouts'])} "
                             f"expErr={int(dv['export_errors'])}"
+                            + f" slots={int(dv['slots'])}:"
+                              f"{mask_str(int(dv['slot_mask']))}"
+                              f" skip={int(dv['layout_skips'])}"
+                              f" compact={dv['compact_ms']:.1f}ms"
                             + (f"  peak cycle {peak['cycle']:.0f} ms, "
                                f"{peak['slow']} slow" if poll else ""))
                 tlast = time.perf_counter()

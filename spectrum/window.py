@@ -31,7 +31,7 @@ from frametime import (DISPLAY_FIELDS, FrameLog, GCWatch, StallDetector, nivcsw,
 from markers import MarkerSet
 from stream_client import StreamServer
 from panels import (AmpPanel, Annunciators, BwPanel, FreqPanel, MarkerPanel,
-                    TablePane, ViewPanel, spur_lines)
+                    TablePane, TracePanel, ViewPanel, spur_lines)
 from plots import SpectrumPlot, TimedPlotWidget, TimingStrip
 from viewmodel import AmpScale, FreqView
 
@@ -58,6 +58,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self.frames: list = []           # every channel of the last acquisition
         self.spectra: dict = {}          # channel -> Spectrum, in display units
         self.active_ch: int | None = None
+        self._channel_list: list[int] = []    # the source's, as last seen
         self.peaks: list = []
         self.frozen = False
         # Autoscale off at startup.  A bench analyser opens on a fixed
@@ -92,6 +93,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self.freq_panel = FreqPanel()
         self.amp_panel = AmpPanel(self.scale, auto_default=self.auto_scale)
         self.bw_panel = BwPanel(args.window, args.average, args.detector)
+        self.trace_panel = TracePanel()
         self.marker_panel = MarkerPanel(DEFAULT_THRESHOLD_DB, DEFAULT_EXCURSION_DB)
         self.view_panel = ViewPanel(timing_default=bool(args.timing_strip))
 
@@ -99,6 +101,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         tabs.setDocumentMode(True)
         for panel, name in ((self.freq_panel, "FREQ"), (self.amp_panel, "AMPT"),
                             (self.bw_panel, "BW / DET"),
+                            (self.trace_panel, "TRACE"),
                             (self.marker_panel, "MARKER"),
                             (self.view_panel, "VIEW")):
             tabs.addTab(panel, name)
@@ -181,6 +184,10 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         b.peak_hold_changed.connect(lambda on: setattr(self.eng, "peak_hold", on))
         b.reset.connect(self.eng.reset)
 
+        t = self.trace_panel
+        t.active_changed.connect(self._set_active_channel)
+        t.visibility_changed.connect(self._set_channel_visible)
+
         m.peak_search.connect(self.peak_search)
         m.step_peak.connect(self.step_peak)
         m.add_delta.connect(self.add_delta_marker)
@@ -223,6 +230,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         self._process_group(self.frames)
         self.plot.set_spectra(self.spectra)
         self.plot.redraw()
+        self.markers.refresh(self.spectra)
 
     def _process_group(self, frames):
         """Spectra for one acquisition, in display units, and the active one.
@@ -231,27 +239,95 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         source but the trace under the cursor must not change.
         """
         spectra = self.eng.process(frames)
-        for f in frames:
-            spectra[f.channel] = self._to_units(spectra[f.channel], f)
         self.frames, self.spectra = frames, spectra
         if self.active_ch not in spectra:
-            self.active_ch = frames[0].channel
+            shown = [f.channel for f in frames if f.channel not in self.plot.hidden]
+            self.active_ch = shown[0] if shown else frames[0].channel
+        # Each channel shifts by its own offset.  Channels have their own V/div,
+        # so a single offset -- which this was, the last channel's winning --
+        # reads right for one channel and wrong by the V/div ratio for the rest.
+        for f in frames:
+            off = self._unit_offset_for(f)
+            if f.channel == self.active_ch:
+                self.unit_offset = off
+            if off:
+                spectra[f.channel].power_db = spectra[f.channel].power_db + off
         self.frame = next(f for f in frames if f.channel == self.active_ch)
         self.spec = spectra[self.active_ch]
+        self._sync_channels(frames)
 
-    def _to_units(self, spec, frame=None):
-        """Shift a freshly computed spectrum into the selected units."""
-        if spec is None:
-            return spec
-        frame = frame if frame is not None else self.frame
-        yinc = getattr(frame, "yinc", 0.0) if frame is not None else 0.0
-        full_scale = float(2 ** (8 * getattr(frame, "samples", None).itemsize)) \
-            if frame is not None and getattr(frame, "samples", None) is not None \
-            else 0.0
-        self.unit_offset = unit_offset_db(self.amp_unit, yinc, full_scale)
-        if self.unit_offset:
-            spec.power_db = spec.power_db + self.unit_offset
-        return spec
+    def _unit_offset_for(self, frame, unit: str | None = None) -> float:
+        """dB from dBFS to `unit` (default: the current one) on this frame's
+        own vertical scale; 0 when the source sent none."""
+        if frame is None or getattr(frame, "samples", None) is None:
+            return 0.0
+        full_scale = float(2 ** (8 * frame.samples.itemsize))
+        return unit_offset_db(unit or self.amp_unit,
+                              getattr(frame, "yinc", 0.0), full_scale)
+
+    # -- channels ----------------------------------------------------------
+    def _ch_label(self) -> int | None:
+        """The active channel, for labels; None with one channel, where naming
+        it would only be noise."""
+        return self.active_ch if len(self._channel_list) > 1 else None
+
+    def _sync_channels(self, frames):
+        """Carry the source's channel set into the TRACE tab and the markers.
+
+        Only when it changes -- with the tap, once per session, since it
+        streams whatever was switched on when it started.
+        """
+        chans = [f.channel for f in frames]
+        if chans == self._channel_list:
+            return
+        self._channel_list = chans
+        hidden = self.plot.hidden & set(chans)
+        self.plot.set_hidden(hidden)
+        self.plot.set_active(self.active_ch)
+        self.markers.set_multi(len(chans) > 1)
+        self.markers.set_hidden(hidden)
+        self.tables.set_multi(len(chans) > 1)
+        self.trace_panel.set_channels(chans, self.active_ch, hidden)
+
+    def _set_active_channel(self, ch: int):
+        """Point the readouts at another channel.
+
+        Nothing is recomputed but what reads one spectrum: the peak list (its
+        indices belong to the old channel's trace), the annotation block and
+        the units offset the graticule is shifted by on a unit change.
+        Markers stay where they are, on their own channels.
+        """
+        if ch == self.active_ch or ch not in self.spectra:
+            return
+        self.active_ch = ch
+        self.frame = next(f for f in self.frames if f.channel == ch)
+        self.spec = self.spectra[ch]
+        self.unit_offset = self._unit_offset_for(self.frame)
+        self.plot.set_active(ch)
+        self.trace_panel.show_active(ch)
+        self._recompute_peaks()
+        self._show_annotation()
+
+    def _set_channel_visible(self, ch: int, on: bool):
+        """Show or hide one channel's trace.  It keeps being processed."""
+        hidden = set(self.plot.hidden)
+        if on:
+            hidden.discard(ch)
+        else:
+            shown = [c for c in self._channel_list if c != ch and c not in hidden]
+            if not shown:
+                # An empty plot with every readout still quoting a hidden trace
+                # is a worse state than refusing the click.
+                self.trace_panel.show_visible(ch, True)
+                self.status.setText("at least one channel has to stay visible")
+                return
+            hidden.add(ch)
+            if ch == self.active_ch:
+                self._set_active_channel(shown[0])
+        self.plot.set_hidden(hidden)
+        self.markers.set_hidden(hidden)
+        self.plot.redraw()
+        self._autoscale()
 
     def _set_amp_unit(self, unit: str):
         """Switch units, keeping the trace where it is on screen.
@@ -261,18 +337,17 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         signal jumped.
         """
         prev = self.unit_offset
-        self.amp_unit = unit
-        frame = self.frame
-        yinc = getattr(frame, "yinc", 0.0) if frame is not None else 0.0
-        fs = float(2 ** (8 * frame.samples.itemsize)) if frame is not None else 0.0
-        self.unit_offset = unit_offset_db(unit, yinc, fs)
-        if unit != "dBFS" and not self.unit_offset:
+        # Every channel needs a scale, or one of them would be labelled in
+        # absolute units while still reading dBFS.
+        if unit != "dBFS" and not all(self._unit_offset_for(f, unit)
+                                      for f in (self.frames or [self.frame])):
             self.status.setText(
-                f"{unit} needs the scope's volts-per-code, which this source "
-                f"did not send -- staying in dBFS")
-            self.amp_unit = "dBFS"
-            self.view_panel.show_unit("dBFS")
+                f"{unit} needs the scope's volts-per-code for every channel, "
+                f"which this source did not send -- staying in {self.amp_unit}")
+            self.view_panel.show_unit(self.amp_unit)
             return
+        self.amp_unit = unit
+        self.unit_offset = self._unit_offset_for(self.frame)
         delta = self.unit_offset - prev
         self.scale.ref_level += delta
         self.amp_panel.show_scale()
@@ -346,9 +421,11 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         # Scale from what is *visible*, not the whole record: after zooming
         # into a quiet corner, a full-span autoscale would leave the trace a
         # flat line at the bottom of a graticule sized for a distant carrier.
-        # With several channels, fit all of them -- they share one scale.
+        # With several channels, fit every visible one -- they share one scale,
+        # and a hidden channel's level must not squash the ones on screen.
         bands = []
-        for s in (self.spectra.values() if self.spectra else [self.spec]):
+        shown = [s for ch, s in self.spectra.items() if ch not in self.plot.hidden]
+        for s in (shown or [self.spec]):
             lo = int(np.searchsorted(s.freqs, self.view.lo, "left"))
             hi = int(np.searchsorted(s.freqs, self.view.hi, "right"))
             band = s.power_db[max(0, lo):max(lo + 1, hi)]
@@ -418,15 +495,30 @@ class SpectrumWindow(QtWidgets.QMainWindow):
             # and 1 Mpt that is a few kHz, and at a lower rate it must shrink
             # with the bins or it hides real low-frequency signal.
             exclude_dc_hz=max(10.0 * self.spec.rbw, 100.0))
-        self.tables.show_peaks(self.peaks, self.scale.offset)
+        self.tables.show_peaks(self.peaks, self.scale.offset, self._ch_label())
         self._last_peak_t = time.perf_counter()
+
+    def _move_marker(self, m, freq: float):
+        """Put a marker on the active channel's trace, at the bin nearest freq.
+
+        Every marker gesture acts on the active channel, so a marker sitting on
+        another channel moves across with it -- that is how "search CH2" is
+        asked for without a second set of buttons.
+        """
+        m.channel = self.active_ch
+        self.markers.move_to(m, self.spec.freqs, self.spec.power_db, freq)
+
+    def _new_marker(self, freq: float, level: float = 0.0, index: int = 0,
+                    delta: bool = False):
+        return self.markers.add(freq, level, index, delta=delta,
+                                channel=self.active_ch)
 
     def _marker_at(self, freq: float):
         if self.spec is None:
             return
-        m = self.markers.selected or self.markers.add(freq, 0.0, 0)
+        m = self.markers.selected or self._new_marker(freq)
         if m is not None:
-            self.markers.move_to(m, self.spec.freqs, self.spec.power_db, freq)
+            self._move_marker(m, freq)
 
     def _on_click(self, ev):
         """Shift+click places a marker; right-click removes the nearest one."""
@@ -445,9 +537,9 @@ class SpectrumWindow(QtWidgets.QMainWindow):
                 ev.accept()
             return
         if ev.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
-            m = self.markers.add(freq, 0.0, 0)
+            m = self._new_marker(freq)
             if m is not None:
-                self.markers.move_to(m, self.spec.freqs, self.spec.power_db, freq)
+                self._move_marker(m, freq)
             ev.accept()
 
     def peak_search(self):
@@ -458,9 +550,9 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         if not self.peaks:
             return
         top = self.peaks[0]
-        m = self.markers.selected or self.markers.add(top.freq, top.level, top.index)
+        m = self.markers.selected or self._new_marker(top.freq, top.level, top.index)
         if m is not None:
-            self.markers.move_to(m, self.spec.freqs, self.spec.power_db, top.freq)
+            self._move_marker(m, top.freq)
 
     def step_peak(self, direction: str):
         m = self.markers.selected
@@ -472,7 +564,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         cur = m.level if direction == "next" else m.freq
         nxt = next_peak(self.peaks, cur, direction)
         if nxt is not None:
-            self.markers.move_to(m, self.spec.freqs, self.spec.power_db, nxt.freq)
+            self._move_marker(m, nxt.freq)
 
     def add_delta_marker(self):
         """Add a marker that reads against the current one.
@@ -480,6 +572,10 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         The current marker becomes the reference and keeps its absolute
         readout; the new one reads the difference.  That asymmetry is
         Tektronix's stated rule and the thing people expect.
+
+        The new marker goes on the active channel, which need not be the
+        reference's: a reference on CH1 and a delta added with CH2 active read
+        CH2 - CH1 at one frequency, the comparison two channels are for.
         """
         if self.spec is None or self.markers.selected is None:
             self.peak_search()
@@ -487,9 +583,9 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         if cur is None:
             return
         self.markers.reference = cur
-        m = self.markers.add(cur.freq, cur.level, cur.index, delta=True)
+        m = self._new_marker(cur.freq, cur.level, cur.index, delta=True)
         if m is not None:
-            self.markers.move_to(m, self.spec.freqs, self.spec.power_db, cur.freq)
+            self._move_marker(m, cur.freq)
 
     def marker_to_centre(self):
         m = self.markers.selected
@@ -515,7 +611,17 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         if self.spec is None:
             return
         path = self._ask_path("Export trace (full resolution)", "trace.csv")
-        if path:
+        if not path:
+            return
+        if len(self.spectra) > 1:
+            # Every channel, hidden ones included: an export is the data, and
+            # hiding is only about what fits on screen.
+            n = analysis.write_traces_csv(
+                path, self.spectra, {f.channel: f.yinc for f in self.frames},
+                unit=self.amp_unit)
+            self.status.setText(f"wrote {n:,} bins x {len(self.spectra)} "
+                                f"channels to {path}")
+        else:
             n = analysis.write_trace_csv(path, self.spec, full=True,
                                          unit=self.amp_unit)
             self.status.setText(f"wrote {n:,} bins to {path}")
@@ -528,7 +634,8 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         path = self._ask_path("Export peak table", "peaks.csv")
         if path:
             n = analysis.write_peaks_csv(path, self.peaks, self.spec,
-                                         self.scale.offset, unit=self.amp_unit)
+                                         self.scale.offset, unit=self.amp_unit,
+                                         channel=self._ch_label())
             self.status.setText(f"wrote {n} peaks to {path}")
 
     def save_screenshot(self, path: str = ""):
@@ -598,7 +705,7 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         if not self.frozen:
             self.plot.set_spectra(self.spectra)
             self.plot.redraw()
-            self.markers.refresh(spec.freqs, spec.power_db)
+            self.markers.refresh(self.spectra)
             self._autoscale()
             if (self.tables.isVisible() and self.tables.currentIndex() == 1
                     and time.perf_counter() - self._last_peak_t > PEAK_INTERVAL_S):
@@ -707,7 +814,9 @@ class SpectrumWindow(QtWidgets.QMainWindow):
         if spec is None:
             return
         off = f"  offset {self.scale.offset:+.1f} dB" if self.scale.offset else ""
+        ch = self._ch_label()
         self.annot.setText(
+            (f"CH{ch} active   |   " if ch is not None else "") +
             f"ref {self.scale.ref_level:+.1f} {self.amp_unit}   "
             f"{self.scale.db_per_div:g} dB/div{off}   |   "
             f"centre {format_hz(self.view.centre)}   "

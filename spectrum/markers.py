@@ -10,6 +10,10 @@ Placement snaps to the nearest FFT bin and then reports that bin's true
 frequency, not the mouse's -- a marker that reported where you clicked rather
 than what you clicked on would be a worse readout than the status bar it
 replaces.
+
+Each marker sits on one channel's trace and reads that channel's level, which
+is what makes a delta between markers on two channels the comparison readout:
+CH2 - CH1 at one frequency.
 """
 from __future__ import annotations
 
@@ -24,9 +28,11 @@ from analysis import format_hz
 MAX_MARKERS = 8            # Rigol's marker table is 8 rows; so is ours
 
 # Distinct enough to tell apart on a dark background at 1 px, and stable per
-# marker number so a marker keeps its colour as others come and go.
-MARKER_COLOURS = ("#f0c040", "#40d0a0", "#e06060", "#a080e0",
-                  "#60b0e0", "#d0d060", "#e090c0", "#80d060")
+# marker number so a marker keeps its colour as others come and go.  Kept off
+# the channel colours (plots.CHANNEL_COLOURS: yellow, cyan, magenta, blue) --
+# the first set had a yellow and a cyan, and a marker then read as a channel.
+MARKER_COLOURS = ("#ff9030", "#80e050", "#ff5050", "#f0f0f0",
+                  "#c89060", "#ffa0c0", "#a0a0a0", "#b0d890")
 
 
 @dataclass
@@ -37,6 +43,7 @@ class Marker:
     index: int = 0
     delta: bool = False            # read against the reference marker
     active: bool = True
+    channel: int = 1               # whose trace it sits on and reads
     _items: list = field(default_factory=list, repr=False)
 
     @property
@@ -66,15 +73,19 @@ class MarkerSet(QtCore.QObject):
         # Only the label.  Levels arrive already in these units (the window
         # shifts power_db before markers read it), so nothing is converted here.
         self.unit = "dBFS"
+        # With one channel, naming it on every label is noise.
+        self.multi = False
+        self._hidden: set[int] = set()
 
     # -- lifecycle --------------------------------------------------------
     def add(self, freq: float, level: float, index: int,
-            delta: bool = False) -> Marker | None:
+            delta: bool = False, channel: int = 1) -> Marker | None:
         if len(self.markers) >= MAX_MARKERS:
             return None
         n = next(i for i in range(1, MAX_MARKERS + 1)
                  if all(m.number != i for m in self.markers))
-        m = Marker(number=n, freq=freq, level=level, index=index, delta=delta)
+        m = Marker(number=n, freq=freq, level=level, index=index, delta=delta,
+                   channel=channel)
         self.markers.append(m)
         self.markers.sort(key=lambda m: m.number)
         if self.reference is None:
@@ -111,26 +122,42 @@ class MarkerSet(QtCore.QObject):
         self._place(m)
         self.changed.emit()
 
-    def refresh(self, freqs: np.ndarray, db: np.ndarray):
-        """Re-read every marker's level from a new frame, holding frequency.
+    def refresh(self, spectra: dict):
+        """Re-read every marker's level from its own channel's new spectrum,
+        holding frequency.
 
         A marker is pinned in frequency, not in amplitude: the whole point is
-        to watch one frequency's level change frame to frame.
+        to watch one frequency's level change frame to frame.  A marker whose
+        channel is absent from `spectra` keeps its last reading.
         """
-        if db.size == 0:
+        if not self.markers:
             return
         for m in self.markers:
-            if m.index < db.size:
-                m.level = float(db[m.index])
+            s = spectra.get(m.channel)
+            if s is not None and m.index < s.power_db.size:
+                m.level = float(s.power_db[m.index])
                 self._place(m)
-        if self.markers:
-            self.changed.emit()
+        self.changed.emit()
 
     def set_unit(self, unit: str):
         self.unit = unit
         for m in self.markers:
             self._place(m)
         self.changed.emit()
+
+    def set_multi(self, on: bool):
+        self.multi = bool(on)
+        for m in self.markers:
+            self._place(m)
+        self.changed.emit()
+
+    def set_hidden(self, hidden):
+        """A marker on a hidden channel's trace is hidden with it: left up, it
+        would mark a level on a curve that is not on screen."""
+        self._hidden = set(hidden)
+        for m in self.markers:
+            for it in m._items:
+                it.setVisible(m.channel not in self._hidden)
 
     def set_log_x(self, on: bool):
         self._log_x = bool(on)
@@ -154,6 +181,8 @@ class MarkerSet(QtCore.QObject):
         self.plot.addItem(dot)
         self.plot.addItem(label)
         m._items = [dot, label]
+        for it in m._items:
+            it.setVisible(m.channel not in self._hidden)
         self._place(m)
 
     def _place(self, m: Marker):
@@ -165,28 +194,40 @@ class MarkerSet(QtCore.QObject):
         label.setText(self.text_for(m))
         label.setPos(x, m.level)
 
+    def _is_delta(self, m: Marker) -> bool:
+        return m.delta and self.reference is not None and self.reference is not m
+
     def text_for(self, m: Marker) -> str:
         """The marker's own on-plot label."""
-        if m.delta and self.reference is not None and self.reference is not m:
-            df, dl = m.delta_from(self.reference)
-            return f"Δ{m.number}  {format_hz(df, 3)}  {dl:+.2f} dB"
-        return f"{m.number}  {format_hz(m.freq, 4)}  {m.level:.2f} {self.unit}"
+        tag = f" CH{m.channel}" if self.multi else ""
+        if self._is_delta(m):
+            ref = self.reference
+            if self.multi and ref.channel != m.channel:
+                tag = f" CH{m.channel}−CH{ref.channel}"
+            df, dl = m.delta_from(ref)
+            return f"Δ{m.number}{tag}  {format_hz(df, 3)}  {dl:+.2f} dB"
+        return f"{m.number}{tag}  {format_hz(m.freq, 4)}  {m.level:.2f} {self.unit}"
 
     # -- table ------------------------------------------------------------
     def rows(self, offset: float = 0.0) -> list[tuple]:
-        """(number, type, frequency, level) per marker, for the marker table.
+        """(number, channel, type, frequency, level) per marker, for the table.
 
         Delta rows carry the difference; the reference marker's own row stays
-        absolute regardless, which is Tektronix's stated rule.
+        absolute regardless, which is Tektronix's stated rule.  A delta against
+        a marker on another channel says so in its channel cell.
         """
         out = []
         for m in self.markers:
-            if m.delta and self.reference is not None and self.reference is not m:
-                df, dl = m.delta_from(self.reference)
-                out.append((m.number, f"Δ{self.reference.number}",
+            ch = f"CH{m.channel}"
+            if self._is_delta(m):
+                ref = self.reference
+                if ref.channel != m.channel:
+                    ch = f"CH{m.channel}−{ref.channel}"
+                df, dl = m.delta_from(ref)
+                out.append((m.number, ch, f"Δ{ref.number}",
                             format_hz(df, 4), f"{dl:+.2f} dB"))
             else:
                 tag = "ref" if m is self.reference else "normal"
-                out.append((m.number, tag, format_hz(m.freq, 4),
+                out.append((m.number, ch, tag, format_hz(m.freq, 4),
                             f"{m.level + offset:.2f} {self.unit}"))
         return out

@@ -16,6 +16,11 @@ what the scope says it captured and that the window still keeps up.
     .venv/bin/python tests/acq_sweep.py --timebases 1ms,2ms,5ms \\
         --depths 100k,1M --no-gui
 
+    # four channels, each judged against its own tone; the scope's channel
+    # switches are put back at the end
+    .venv/bin/python tests/acq_sweep.py 192.168.23.20 --channels 1,2,3,4 \\
+        --tones 1M,3M,5M,7M --timebases 2ms --depths 1M
+
     # no scope: the PC half only (FFT and draw cost at each record size)
     .venv/bin/python tests/acq_sweep.py --synthetic
 
@@ -38,8 +43,8 @@ sample rate once while priming and sizes the scope-side buffers from them, and
 nothing talks SCPI while it streams.  Frida startup makes that ~10-15 s of
 overhead a session.
 
-The scope's original timebase and depth are restored at the end, including on
-Ctrl+C.  Results land in --out as results.csv / results.json, with each
+The scope's original timebase and depth -- and, with --channels, which channels
+are switched on -- are restored at the end, including on Ctrl+C.  Results land in --out as results.csv / results.json, with each
 session's tap log, GUI log, screenshot and timing CSV beside them.
 
 Known limits this is expected to hit, rather than bugs it has found:
@@ -47,9 +52,10 @@ Known limits this is expected to hit, rather than bugs it has found:
   * The on-scope driver abandons an acquisition after a fixed 2 s
     (libmhotap.c, driver_main).  A record longer than that -- 10 x timebase,
     so beyond ~200 ms/div -- will produce arm timeouts and no frames.
-  * The tap mallocs NSLOTS (3) x depth x 2 B on the scope: 60 MB at 10 M,
-    300 MB at 50 M, and a 50 M record is 100 MB a frame over a link measured
-    at ~35 MB/s.  Depths above 10 M need --allow-large.
+  * The tap mallocs NSLOTS (3) x depth x 2 B x channels on the scope: 60 MB
+    at 10 M on one channel, 240 MB on four, and a 50 M record is 100 MB a
+    frame per channel over a link measured at ~35 MB/s.  A frame of more than
+    10 M samples (depth x channels) needs --allow-large.
 """
 from __future__ import annotations
 
@@ -173,6 +179,27 @@ def restore_state(ip: str, orig: dict) -> None:
               file=sys.stderr)
 
 
+def read_channels(sc: Scope) -> list[int]:
+    return [c for c in (1, 2, 3, 4)
+            if sc.query(f":CHANnel{c}:DISPlay?").strip() == "1"]
+
+
+def set_channels(ip: str, channels: list[int]) -> list[int]:
+    """Switch exactly these channels on, and read back which are.
+
+    On before off, so there is never a moment with nothing enabled -- the tap
+    streams every enabled channel and the scope will not arm with none.
+    """
+    with Scope(host=ip, timeout=10.0) as sc:
+        for c in channels:
+            sc.write(f":CHANnel{c}:DISPlay ON")
+        for c in (1, 2, 3, 4):
+            if c not in channels:
+                sc.write(f":CHANnel{c}:DISPlay OFF")
+        sc.opc()
+        return read_channels(sc)
+
+
 # -- tap log ----------------------------------------------------------------
 
 # tap_stream.py's own lines, via adbutil.log.  Formats as of 2026-09-13; if a
@@ -184,6 +211,11 @@ RE_TAPSTAT = re.compile(
     r"tap\s+([\d.]+) fps\s+([\d.]+) MB/s\s+in=(\d+) sent=(\d+) dropped=(\d+)"
     r"\s+cycles=(\d+) arm=(\d+)ms rnt=(\d+)ms lock=(\d+)ms export=(\d+)ms "
     r"cycle=(\d+)ms armTO=(\d+) expErr=(\d+)")
+# Appended after expErr=: the app's export layout (slot count and sampled
+# channels) and captures skipped because it no longer held every streamed
+# channel (libmhotap.c layout_keep).
+RE_SLOTS = re.compile(r"slots=(\S+)")
+RE_SKIP = re.compile(r"skip=(\d+)")
 
 
 def parse_tap_log(path: str) -> dict:
@@ -213,6 +245,12 @@ def parse_tap_log(path: str) -> dict:
         out.update(arm_timeouts=int(s[11]) - int(base[11]),
                    export_errors=int(s[12]) - int(base[12]))
     out["tap_warnings"] = len(re.findall(r"WARNING", text))
+    slots, skips = RE_SLOTS.findall(text), RE_SKIP.findall(text)
+    if slots:
+        out["slots"] = slots[-1]
+    if skips:
+        # Relative to the first report, like the counters above.
+        out["layout_skips"] = int(skips[-1]) - (int(skips[0]) if len(skips) > 1 else 0)
     return out
 
 
@@ -222,8 +260,17 @@ def gui_args(a, cfg: dict, extra=()) -> list[str]:
     """fft_gui arguments for this point, shared by both phases."""
     if a.synthetic:
         return ["--source", "synthetic", "--points", str(cfg["expect_npts"]),
-                "--sample-rate", repr(cfg["expect_srate"]), *extra]
+                "--sample-rate", repr(cfg["expect_srate"]),
+                "--synthetic-channels", str(len(a.channels) or 1), *extra]
     return ["--tap", a.ip, "--channel", str(a.channel), *extra]
+
+
+def tone_map(a, chans) -> dict[int, float]:
+    """The tone each streamed channel should peak at: --tones in channel
+    order, or --tone on the first channel alone."""
+    if a.tones:
+        return dict(zip(chans, a.tones))
+    return {chans[0]: a.tone} if a.tone and chans else {}
 
 
 def run_headless(a, cfg: dict, outdir: str, tag: str) -> dict:
@@ -234,11 +281,10 @@ def run_headless(a, cfg: dict, outdir: str, tag: str) -> dict:
     # passes every check at 1 Mpt / 50 MSa/s -- found on the first live run.
     if args.tap:
         args.source = "stream"
-    eng = SpectrumEngine(window=args.window, averaging=1)
     r: dict = {}
     src = fft_gui.build(args).start()
     try:
-        _headless_loop(a, src, eng, cfg, r)
+        _headless_loop(a, src, args.window, cfg, r)
     finally:
         src.stop()
         t = getattr(src, "_thread", None)
@@ -252,7 +298,7 @@ def run_headless(a, cfg: dict, outdir: str, tag: str) -> dict:
     return r
 
 
-def _headless_loop(a, src, eng, cfg: dict, r: dict) -> None:
+def _headless_loop(a, src, window: str, cfg: dict, r: dict) -> None:
     alive = getattr(src, "tap_alive", lambda: True)
     t0 = time.perf_counter()
 
@@ -260,8 +306,7 @@ def _headless_loop(a, src, eng, cfg: dict, r: dict) -> None:
     # long record's first acquisition all land, so it is timed separately and
     # never mixed into the rate.
     while True:
-        f = src.get(timeout=1.0)
-        if f is not None:
+        if src.get_group(timeout=1.0):
             break
         st = src.stats()
         if st.get("error"):
@@ -279,41 +324,59 @@ def _headless_loop(a, src, eng, cfg: dict, r: dict) -> None:
     # 12.7 fps cumulative against ~15 steady), so settle before counting.
     t_settle = time.perf_counter() + a.settle
     while time.perf_counter() < t_settle:
-        src.get(timeout=0.5)
+        src.get_group(timeout=0.5)
 
     st0 = src.stats()
     b0 = getattr(src, "bytes", None)
     t_start = time.perf_counter()
-    npts, srates, fft_ms = set(), set(), []
-    nonfinite = nyq_bad = tone_bad = 0
-    peak_hz: list[float] = []
+    npts, srates, chan_sets, fft_ms = set(), set(), set(), []
+    nonfinite = nyq_bad = 0
+    engines: dict = {}
+    tones: dict = {}
+    tone_bad: dict = {}
+    peak_hz: dict = {}
+    peak_db: dict = {}
     while time.perf_counter() - t_start < a.seconds:
-        f = src.get(timeout=1.0)
-        if f is None:
+        group = src.get_group(timeout=1.0)
+        if not group:
             if not alive():
                 r["error"] = "tap exited mid-run: " + src.tap_log_tail(3).strip()
                 break
             continue
+        chans = tuple(f.channel for f in group)
+        if not chan_sets:
+            tones = tone_map(a, chans)
+        chan_sets.add(chans)
         t = time.perf_counter()
-        spec = eng.process(f.samples, f.sample_rate)
+        # Every channel of the acquisition, as the window processes it.
+        specs = [(f, engines.setdefault(f.channel, SpectrumEngine(window=window))
+                  .process(f.samples, f.sample_rate)) for f in group]
         fft_ms.append((time.perf_counter() - t) * 1e3)
-        npts.add(f.npoints)
-        srates.add(f.sample_rate)
         # Outside the FFT timing on purpose: this is the harness's cost, not
         # the analyser's.
-        if not np.isfinite(spec.power_db).all():
-            nonfinite += 1
-        if abs(spec.freqs[-1] - f.sample_rate / 2) > 2 * spec.resolution:
-            nyq_bad += 1
-        if a.tone:
+        for f, spec in specs:
+            npts.add(f.npoints)
+            srates.add(f.sample_rate)
+            if not np.isfinite(spec.power_db).all():
+                nonfinite += 1
+            if abs(spec.freqs[-1] - f.sample_rate / 2) > 2 * spec.resolution:
+                nyq_bad += 1
+            # Every channel's strongest peak is kept, tone or not: on an input
+            # with nothing connected, a peak at another channel's tone and
+            # near its level means the frame was split wrongly.  Bin 0 (DC)
+            # is skipped.
+            pk = 1 + int(np.argmax(spec.power_db[1:]))
+            peak_hz.setdefault(f.channel, []).append(float(spec.freqs[pk]))
+            peak_db.setdefault(f.channel, []).append(float(spec.power_db[pk]))
+            want = tones.get(f.channel)
             # The only check that knows what the samples should contain.  A
             # record whose sample spacing does not match its header passes
             # everything above -- 10 M first failed exactly that way, with a
-            # 1 MHz input peaking at 10 MHz.  Bin 0 (DC) is skipped.
-            pk = 1 + int(np.argmax(spec.power_db[1:]))
-            peak_hz.append(float(spec.freqs[pk]))
-            if abs(spec.freqs[pk] - a.tone) > max(3 * spec.resolution, 1e-3 * a.tone):
-                tone_bad += 1
+            # 1 MHz input peaking at 10 MHz -- and so does a frame split into
+            # the wrong channels, which a different tone per channel catches.
+            if want and abs(spec.freqs[pk] - want) > max(3 * spec.resolution,
+                                                         1e-3 * want):
+                tone_bad[f.channel] = tone_bad.get(f.channel, 0) + 1
     el = time.perf_counter() - t_start
     st1 = src.stats()
 
@@ -325,9 +388,11 @@ def _headless_loop(a, src, eng, cfg: dict, r: dict) -> None:
         pc_dropped=st1.get("dropped", 0) - st0.get("dropped", 0),
         repeats=st1.get("repeats", 0) - st0.get("repeats", 0),
         frame_npts=sorted(npts), frame_srates=sorted(srates),
+        channels=[list(c) for c in sorted(chan_sets)],
         nonfinite=nonfinite, nyquist_bad=nyq_bad,
-        tone_hz=a.tone, tone_bad=tone_bad,
-        peak_hz=round(float(np.median(peak_hz)), 1) if peak_hz else None)
+        tone_hz=tones, tone_bad=tone_bad,
+        peak_hz={ch: round(float(np.median(v)), 1) for ch, v in peak_hz.items()},
+        peak_db={ch: round(float(np.median(v)), 1) for ch, v in peak_db.items()})
     if b0 is not None:
         r["mbps"] = round((src.bytes - b0) / el / 1e6, 1)
     if fft_ms:
@@ -427,10 +492,17 @@ def judge(cfg: dict, r: dict) -> tuple[str, list[str]]:
             fail.append(f"{r['nonfinite']} spectra with NaN/inf")
         if r.get("nyquist_bad"):
             fail.append(f"{r['nyquist_bad']} spectra with Nyquist misplaced")
-        if r.get("tone_bad"):
-            fail.append(f"{r['tone_bad']} spectra peaked away from the "
-                        f"{r['tone_hz'] / 1e6:g} MHz tone (median peak "
-                        f"{r['peak_hz'] / 1e6:g} MHz)")
+        if len(r.get("channels", [])) > 1:
+            fail.append(f"channel set changed mid-run: {r['channels']}")
+        if r.get("channels") and cfg.get("channels") and \
+                r["channels"][0] != cfg["channels"]:
+            fail.append(f"streamed CH{'+'.join(map(str, r['channels'][0]))} "
+                        f"but the scope has CH{'+'.join(map(str, cfg['channels']))} on")
+        for ch, n in (r.get("tone_bad") or {}).items():
+            if n:
+                fail.append(f"{n} CH{ch} spectra peaked away from its "
+                            f"{r['tone_hz'][ch] / 1e6:g} MHz tone (median peak "
+                            f"{r['peak_hz'].get(ch, 0.0) / 1e6:g} MHz)")
 
         n = r["frame_npts"][0] if r.get("frame_npts") else 0
         if n and cfg.get("mdepth") and n != int(cfg["mdepth"]):
@@ -449,7 +521,11 @@ def judge(cfg: dict, r: dict) -> tuple[str, list[str]]:
         # on.  Only signs the capture itself misbehaved are.
         for k, what in (("arm_timeouts", "captures with no ReadNormTrace "
                                          "success in 2 s"),
-                        ("export_errors", "exports that returned an error")):
+                        ("export_errors", "exports that returned an error"),
+                        ("layout_skips", "captures skipped because the app's "
+                                         "export layout lost a streamed "
+                                         "channel (channels or trigger "
+                                         "source changed?)")):
             if r.get(k):
                 warn.append(f"{r[k]} {what}")
     if "gui_rc" in r or "gui_error" in r:
@@ -469,7 +545,7 @@ def judge(cfg: dict, r: dict) -> tuple[str, list[str]]:
 # -- driver -----------------------------------------------------------------
 
 COLUMNS = [
-    ("tb", 7), ("depth", 6), ("MDEPth", 9), ("MSa/s", 8), ("pts", 9),
+    ("tb", 7), ("depth", 6), ("MDEPth", 9), ("MSa/s", 8), ("pts", 9), ("ch", 7),
     ("acq", 7), ("fps", 5), ("MB/s", 5), ("fft", 5), ("pcDrop", 6),
     ("armTO", 5), ("rep", 4), ("draw", 5), ("frMed", 5), ("drawMs", 6),
     ("verdict", 7),
@@ -485,6 +561,7 @@ def row_cells(res: dict) -> list[str]:
         return "-" if v is None else f.format(v)
     return [fmt_time(c["timebase_req"]), c["depth_req"],
             g(c.get("mdepth"), "{:.0f}"), g(sr and sr / 1e6, "{:g}"), g(n),
+            g(r.get("channels") and "+".join(map(str, r["channels"][0]))),
             g(n and sr and fmt_time(n / sr)), g(r.get("fps")), g(r.get("mbps")),
             g(r.get("fft_ms_med")), g(r.get("pc_dropped")),
             g(r.get("arm_timeouts")), g(r.get("repeats")),
@@ -515,9 +592,13 @@ def plan(a) -> list[dict]:
     cfgs = []
     for d in a.depths:
         n = parse_si(d)
-        if n > LARGE_DEPTH and not a.allow_large:
-            print(f"skipping depth {d}: above {depth_token(LARGE_DEPTH)} needs "
-                  f"--allow-large (scope-side buffers are 3 x depth x 2 B)")
+        # Without --channels the enabled count is not known until the tap
+        # starts, so one is assumed.
+        nch = len(a.channels) or 1
+        if n * nch > LARGE_DEPTH and not a.allow_large:
+            print(f"skipping depth {d}: a frame over {depth_token(LARGE_DEPTH)} "
+                  f"samples needs --allow-large (scope-side buffers are "
+                  f"3 x depth x 2 B x {nch} channel{'s' if nch > 1 else ''})")
             continue
         for tb_text in a.timebases:
             tb = parse_si(tb_text, "s")
@@ -526,6 +607,8 @@ def plan(a) -> list[dict]:
                 sr = min(n / (10 * tb), a.synthetic_max_srate)
                 cfg.update(timebase=tb, mdepth=n, srate=sr,
                            expect_npts=int(n), expect_srate=sr)
+                if a.channels:
+                    cfg["channels"] = list(range(1, len(a.channels) + 1))
             cfgs.append(cfg)
     return cfgs
 
@@ -547,6 +630,18 @@ def main() -> int:
                     help="a tone known to be on the input, e.g. 1M; every "
                          "spectrum's strongest peak must land on it.  Catches "
                          "records whose samples do not match their sample rate")
+    ap.add_argument("--channels", default="", metavar="LIST",
+                    help="switch exactly these channels on for the sweep, e.g. "
+                         "1,2,3,4, and restore the scope's own choice at the "
+                         "end.  Every enabled channel is streamed.  With "
+                         "--synthetic, the count is what matters (CH1..CHn)")
+    ap.add_argument("--tones", default="", metavar="LIST",
+                    help="one known tone per streamed channel, in channel "
+                         "order, e.g. 1M,3M: each channel's strongest peak must "
+                         "land on its own.  Catches a frame split into the "
+                         "wrong channels as well as a wrong sample rate.  "
+                         "Channels past the last tone are only reported "
+                         "(peak_hz / peak_db in results.json)")
     ap.add_argument("--seconds", type=float, default=10.0,
                     help="headless measurement window per point, after settling")
     ap.add_argument("--settle", type=float, default=3.0,
@@ -576,6 +671,17 @@ def main() -> int:
     a = ap.parse_args()
     a.timebases = [t for t in a.timebases.split(",") if t.strip()]
     a.depths = [d for d in a.depths.split(",") if d.strip()]
+    try:
+        a.channels = sorted({int(c) for c in a.channels.split(",") if c.strip()})
+        a.tones = [parse_si(t, "Hz") for t in a.tones.split(",") if t.strip()]
+    except (ValueError, argparse.ArgumentTypeError) as e:
+        ap.error(str(e))
+    if any(c not in (1, 2, 3, 4) for c in a.channels):
+        ap.error(f"--channels must be from 1-4, got {a.channels}")
+    if a.channels and len(a.tones) > len(a.channels):
+        ap.error(f"{len(a.tones)} tones for {len(a.channels)} channels")
+    if a.channels:
+        a.channel = a.channels[0]       # the one tap_stream.py switches on
 
     cfgs = plan(a)
     if not cfgs:
@@ -597,6 +703,7 @@ def main() -> int:
         a.gui = False
 
     orig = None
+    orig_ch = None
     if not a.synthetic:
         a.ip = a.ip or fft_gui.load_settings().get("scope_ip", "")
         if not a.ip:
@@ -605,11 +712,24 @@ def main() -> int:
             with Scope(host=a.ip, timeout=10.0) as sc:
                 idn = sc.idn
                 orig = read_state(sc)
+                orig_ch = read_channels(sc)
         except (ScopeError, OSError) as e:
             print(f"cannot reach the scope at {a.ip}: {e}", file=sys.stderr)
             return 1
         print(f"{idn}\nstarting from {fmt_time(orig['timebase'])}/div, depth "
-              f"{orig['mdepth_raw']}, {orig['srate'] / 1e6:g} MSa/s")
+              f"{orig['mdepth_raw']}, {orig['srate'] / 1e6:g} MSa/s, "
+              f"CH{'+'.join(map(str, orig_ch))} on")
+        if a.channels and a.channels != orig_ch:
+            got = set_channels(a.ip, a.channels)
+            print(f"switched to CH{'+'.join(map(str, got))}")
+            if got != a.channels:
+                set_channels(a.ip, orig_ch)
+                print(f"the scope took CH{'+'.join(map(str, got))} instead of "
+                      f"CH{'+'.join(map(str, a.channels))}; restored",
+                      file=sys.stderr)
+                return 1
+        for cfg in cfgs:
+            cfg["channels"] = a.channels or orig_ch
 
     outdir = a.out or time.strftime("/tmp/mho-sweep-%Y%m%d-%H%M%S")
     os.makedirs(outdir, exist_ok=True)
@@ -656,6 +776,13 @@ def main() -> int:
     finally:
         if orig is not None:
             restore_state(a.ip, orig)
+        if orig_ch is not None and a.channels and a.channels != orig_ch:
+            try:
+                got = set_channels(a.ip, orig_ch)
+                print(f"restored channels to CH{'+'.join(map(str, got))}")
+            except (ScopeError, OSError) as e:
+                print(f"WARNING: could not restore the channels ({e}); "
+                      f"CH{'+'.join(map(str, orig_ch))} were on", file=sys.stderr)
         write_results(outdir, results)
 
     print_table(results)

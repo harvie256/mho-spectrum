@@ -36,6 +36,13 @@
 #define HDR_BYTES 64
 #define MAGIC     "MHOFRAME"
 #define NSLOTS    3
+#define MAX_CH    4
+/* Set in the u16 at header offset 18, above the channel-count nibble: a table
+ * of one (yinc, yorig, yref) triple of doubles per channel follows the header,
+ * in interleave order.  Only sent with several channels, so a one-channel
+ * frame stays byte-identical to what an older tap sent. */
+#define HDR_FLAG_SCALES 0x100
+#define SCALE_BYTES     24
 
 typedef struct {
     unsigned char *buf;
@@ -58,13 +65,17 @@ static struct {
     double           srate;
     /* Vertical scale, so the PC can show absolute units instead of dBFS.
      * volts = (code - yref) * yinc + yorig, the SCPI convention.  Zero means
-     * "unknown" and the receiver stays in dBFS.  One scale for the frame: with
-     * several channels it is only right while they share a V/div. */
+     * "unknown" and the receiver stays in dBFS.  yinc/yorig/yref go in the
+     * header; with several channels chscale holds one scale per channel, in
+     * interleave order, sent as a table after the header -- each channel has
+     * its own V/div, so one scale for the frame is right for one of them. */
     double           yinc, yorig, yref;
+    double           chscale[MAX_CH][3];
+    int              nscales;        /* leading entries of chscale filled */
     int              bps;
     long             rec_bytes;      /* one frame: points x bps x channels */
     int              nch;            /* channels interleaved in each frame */
-    uint32_t         chmask;         /* which scope channels, bit 0 = CH1 */
+    uint32_t         chmask;         /* which scope channels are sent, bit 0 = CH1 */
 
     /* stats */
     unsigned long    frames_in, frames_sent, frames_dropped, bytes_sent;
@@ -96,7 +107,7 @@ static void *sender_main(void *arg) {
      * inherits whatever created it (a frida thread), which made it impossible
      * to see which core the encode and the send were landing on. */
     pthread_setname_np(pthread_self(), "mhotap-send");
-    unsigned char hdr[HDR_BYTES];
+    unsigned char hdr[HDR_BYTES + MAX_CH * SCALE_BYTES];
     for (;;) {
         pthread_mutex_lock(&G.m);
         while (G.count == 0 && !G.stop)
@@ -109,27 +120,35 @@ static void *sender_main(void *arg) {
 
         /* Layout (little-endian), shared with spectrum/stream_client.py:
          *   0 magic   8 seq   12 samples in the frame (all channels)   16 bps
-         *  18 channel count, 0 = one (as an older tap sends)
+         *  18 u16: low nibble = channel count, 0 = one (as an older tap
+         *     sends); HDR_FLAG_SCALES = a per-channel scale table follows
          *  20 channel mask, bit 0 = CH1 (0 = unknown, receiver numbers 1..n)
-         *  24 sample rate   32 unused   40/48/56 yinc/yorig/yref */
-        memset(hdr, 0, sizeof hdr);
+         *  24 sample rate   32 unused   40/48/56 yinc/yorig/yref
+         *  64 with HDR_FLAG_SCALES: (yinc, yorig, yref) doubles per channel */
+        int nch = G.nch > 1 ? G.nch : 0;
+        int table = nch > 1 && nch <= MAX_CH && G.nscales >= nch;
+        size_t hlen = HDR_BYTES + (table ? (size_t)nch * SCALE_BYTES : 0);
+        memset(hdr, 0, hlen);
         memcpy(hdr, MAGIC, 8);
         uint32_t u32 = seq;                            memcpy(hdr + 8,  &u32, 4);
         u32 = (uint32_t)(len / (G.bps ? G.bps : 2));   memcpy(hdr + 12, &u32, 4);
         uint16_t u16 = (uint16_t)G.bps;                memcpy(hdr + 16, &u16, 2);
-        u16 = (uint16_t)(G.nch > 1 ? G.nch : 0);       memcpy(hdr + 18, &u16, 2);
+        u16 = (uint16_t)(nch | (table ? HDR_FLAG_SCALES : 0));
+                                                       memcpy(hdr + 18, &u16, 2);
         u32 = G.chmask;                                memcpy(hdr + 20, &u32, 4);
         double d = G.srate;                            memcpy(hdr + 24, &d, 8);
         d = G.yinc;                                    memcpy(hdr + 40, &d, 8);
         d = G.yorig;                                   memcpy(hdr + 48, &d, 8);
         d = G.yref;                                    memcpy(hdr + 56, &d, 8);
+        for (int i = 0; table && i < nch; i++)
+            memcpy(hdr + HDR_BYTES + i * SCALE_BYTES, G.chscale[i], SCALE_BYTES);
 
-        if (send_all(G.fd, hdr, HDR_BYTES) != 0 ||
+        if (send_all(G.fd, hdr, hlen) != 0 ||
             send_all(G.fd, sl->buf, (size_t)len) != 0) {
             G.send_errors++;
         } else {
             G.frames_sent++;
-            G.bytes_sent += HDR_BYTES + (unsigned long)len;
+            G.bytes_sent += hlen + (unsigned long)len;
         }
 
         pthread_mutex_lock(&G.m);
@@ -155,6 +174,11 @@ static struct {
     unsigned long cycles, arm_timeouts, export_errors;
     /* The last cycle, split by phase -- see export_main for what each is. */
     double        arm_ms, rnt_wait_ms, lock_wait_ms, export_ms, cycle_ms;
+    double        compact_ms;        /* dropping unwanted slots, after unlock */
+    /* The app's layout at the last export, and captures skipped because it no
+     * longer held every channel being streamed (see layout_keep). */
+    unsigned      slots, slot_mask;
+    unsigned long layout_skips;
 } D;
 
 /* The app's entry points, handed over by mho_tap.js before the loop starts,
@@ -167,19 +191,28 @@ static struct {
     void          *(*get_scope)(void);
     void           (*lock)(void *);
     void           (*unlock)(void *);
+    /* CDrvScope::GetDrvParam(0) and its GetChanCount / GetChanMask: the
+     * interleave ExportData itself uses (fields +0x80 / +0x84). */
+    void          *(*get_param)(void *, unsigned);
+    unsigned       (*param_count)(void *);
+    unsigned       (*param_mask)(void *);
     pthread_mutex_t  m;
     pthread_cond_t   c;
     unsigned long    ok;
 } X = { .m = PTHREAD_MUTEX_INITIALIZER, .c = PTHREAD_COND_INITIALIZER };
 
 void mhotap_export_setup(void *init, void *data, void *back,
-                         void *get_scope, void *lock, void *unlock) {
+                         void *get_scope, void *lock, void *unlock,
+                         void *get_param, void *param_count, void *param_mask) {
     X.init = (exinit_fn)init;
     X.data = (exdata_fn)data;
     X.back = (exback_fn)back;
     X.get_scope = (void *(*)(void))get_scope;
     X.lock = (void (*)(void *))lock;
     X.unlock = (void (*)(void *))unlock;
+    X.get_param = (void *(*)(void *, unsigned))get_param;
+    X.param_count = (unsigned (*)(void *))param_count;
+    X.param_mask = (unsigned (*)(void *))param_mask;
 }
 
 /* Called from the ReadNormTrace return hook, on the app's acquisition thread,
@@ -231,12 +264,59 @@ void mhotap_rnt_done(int ret) {
  *                20 ms/div 10 M 1.72 (34 MB/s: the link, not the loop)
  *   CH1+CH2      2 ms/div 1 M 8.7 fps (wait 87, export 7 ms; the loop runs
  *                ~10 captures/s and the link carries 8.7) */
+/* Keep `nkeep` of every `stride` interleaved uint16 samples, in place.  Safe
+ * going forwards: every write lands at or before each sample still to be
+ * read, because keep[k] >= k and nkeep <= stride. */
+static void compact_slots(uint16_t *b, long npts, int stride,
+                          const int *keep, int nkeep) {
+    for (long j = 0; j < npts; j++) {
+        const uint16_t *src = b + j * stride;
+        uint16_t *dst = b + j * nkeep;
+        for (int k = 0; k < nkeep; k++) dst[k] = src[keep[k]];
+    }
+}
+
+/* Which slots of this export hold the channels being streamed (`want`, bit 0 =
+ * CH1), in order.  ExportData interleaves what the app *samples*, not what is
+ * shown: CDrvSetting::GetSampleChanMask is every channel whose CChannel "on"
+ * flag is set, which includes the trigger source when it is not displayed, and
+ * CDrvParam holds that mask and a slot count of 1, 2 or 4
+ * (DevSystem_GetSampleMode).  CApiWave::getMemoryData, the app's own :WAV:DATA?,
+ * handles only those three counts.  With 1 or 2 slots they are the mask's
+ * channels in order; with 4 they are CH1..CH4 by position, masked or not.
+ * Measured 2026-09-13 over all 15 on/off combinations with the trigger on CH1,
+ * and with it on CH2 (e.g. CH3 shown: mask CH2+CH3, 2 slots).  Returns the
+ * number of slots kept, or -1 if a wanted channel is not in the layout. */
+static int layout_keep(unsigned count, unsigned mask, unsigned want, int *keep) {
+    int slotch[MAX_CH], n = 0;
+    if (count == 4) {
+        for (int c = 0; c < 4; c++) slotch[n++] = c;
+    } else if (count == 1 || count == 2) {
+        for (int c = 0; c < 4 && n < (int)count; c++)
+            if (mask >> c & 1) slotch[n++] = c;
+        if (n != (int)count) return -1;
+    } else {
+        return -1;
+    }
+    if (!want)
+        for (int k = 0; k < n; k++) want |= 1u << slotch[k];
+    int nkeep = 0;
+    for (int c = 0; c < 4; c++) {
+        if (!(want >> c & 1)) continue;
+        int k = 0;
+        while (k < n && slotch[k] != c) k++;
+        if (k == n) return -1;
+        keep[nkeep++] = k;
+    }
+    return nkeep;
+}
+
 static void *export_main(void *arg) {
     (void)arg;
     pthread_setname_np(pthread_self(), "mhotap-export");
     int bps = G.bps ? G.bps : 2;
-    long total = G.rec_bytes / bps;                /* interleaved samples */
-    long chunk = EXPORT_CHUNK_PER_CH * (G.nch > 0 ? G.nch : 1);
+    int nch = G.nch > 0 ? G.nch : 1;
+    long npts = G.rec_bytes / bps / nch;           /* points per channel */
     void *scope = X.get_scope();
     while (!D.stop) {
         double t0 = now_s();
@@ -273,6 +353,26 @@ static void *export_main(void *arg) {
         int err = 0;
         X.lock(scope);
         double t3 = now_s();
+        /* What this export will interleave, read the way ExportData reads it
+         * and under the same lock.  Decided per capture, never at startup: the
+         * layout follows the trigger source and the channel switches, and the
+         * tap's own priming can move it.  A layout that no longer holds every
+         * channel being streamed would send data under the wrong labels, so
+         * that capture is skipped and counted instead. */
+        void *param = X.get_param(scope, 0);
+        unsigned slots = X.param_count(param);
+        D.slots = slots;
+        D.slot_mask = X.param_mask(param);
+        int keep[MAX_CH];
+        int nkeep = layout_keep(slots, D.slot_mask, G.chmask, keep);
+        long total = npts * (long)slots;           /* interleaved samples */
+        if (nkeep != nch || total * bps > G.slot_cap) {
+            X.unlock(scope);
+            D.layout_skips++;
+            D.cycles++;
+            continue;
+        }
+        long chunk = EXPORT_CHUNK_PER_CH * (long)slots;
         for (long off = 0; off < total && !err; off += chunk) {
             long n = total - off < chunk ? total - off : chunk;
             X.init(0);
@@ -285,10 +385,19 @@ static void *export_main(void *arg) {
         double t4 = now_s();
         D.cycles++;
         if (err) { D.export_errors++; continue; }
+        /* Drop the slots of channels not being streamed -- a hidden trigger
+         * source, or an off channel in a 4-slot layout -- outside the lock,
+         * since this is our buffer and nothing of the app's. */
+        long len = total * bps;
+        if (nkeep < (int)slots) {
+            compact_slots((uint16_t *)(void *)buf, npts, (int)slots, keep, nkeep);
+            len = npts * nkeep * bps;
+        }
+        double t5 = now_s();
 
         pthread_mutex_lock(&G.m);
         slot_t *sl = &G.slots[G.head];
-        sl->len = total * bps;
+        sl->len = len;
         sl->seq = G.seq++;
         G.head = (G.head + 1) % NSLOTS;
         G.count++;
@@ -299,6 +408,7 @@ static void *export_main(void *arg) {
         D.rnt_wait_ms  = (t2 - t1) * 1e3;
         D.lock_wait_ms = (t3 - t2) * 1e3;
         D.export_ms    = (t4 - t3) * 1e3;
+        D.compact_ms   = (t5 - t4) * 1e3;
         D.cycle_ms     = (now_s() - t0) * 1e3;
     }
     return NULL;
@@ -313,7 +423,8 @@ int mhotap_drive_start(void *set_state) {
     memset(&D, 0, sizeof D);
     D.set_state = (setstate_fn)set_state;
     if (!D.set_state) return -2;
-    if (!X.init || !X.data || !X.back || !X.get_scope || !X.lock || !X.unlock)
+    if (!X.init || !X.data || !X.back || !X.get_scope || !X.lock || !X.unlock ||
+        !X.get_param || !X.param_count || !X.param_mask)
         return -6;
     if (!G.running || G.rec_bytes <= 0 || G.rec_bytes > G.slot_cap) return -3;
     D.running = 1;
@@ -330,7 +441,7 @@ void mhotap_drive_stop(void) {
     D.running = 0;
 }
 
-void mhotap_drive_stats(double *out /* 8 doubles */) {
+void mhotap_drive_stats(double *out /* 12 doubles */) {
     if (!out) return;
     out[0] = (double)D.cycles;
     out[1] = (double)D.arm_timeouts;
@@ -340,6 +451,10 @@ void mhotap_drive_stats(double *out /* 8 doubles */) {
     out[5] = D.lock_wait_ms;
     out[6] = D.export_ms;
     out[7] = D.cycle_ms;
+    out[8] = D.compact_ms;
+    out[9] = (double)D.layout_skips;
+    out[10] = (double)D.slots;
+    out[11] = (double)D.slot_mask;
 }
 
 /* ---------------------------------------------------------------- public */
@@ -405,6 +520,15 @@ void mhotap_set_rate(double srate) { G.srate = srate; }
 
 void mhotap_set_yscale(double yinc, double yorig, double yref) {
     G.yinc = yinc; G.yorig = yorig; G.yref = yref;
+}
+
+/* One channel's scale; i is its place in the interleave (0 = the lowest
+ * enabled channel).  Set all of them after init, before mhotap_drive_start --
+ * the table is only sent once every interleaved channel has one. */
+void mhotap_set_yscale_ch(int i, double yinc, double yorig, double yref) {
+    if (i < 0 || i >= MAX_CH) return;
+    G.chscale[i][0] = yinc; G.chscale[i][1] = yorig; G.chscale[i][2] = yref;
+    if (G.nscales < i + 1) G.nscales = i + 1;
 }
 
 /* Fills caller-provided storage so the injector needs no struct layout. */

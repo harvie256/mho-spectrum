@@ -64,6 +64,11 @@ class SpectrumPlot(QtCore.QObject):
         self._specs: dict = {}         # channel -> Spectrum, all drawn
         self._curves: dict = {}        # channel -> curve, once there are several
         self._legend = None
+        # Channels not drawn.  Only the drawing stops -- the window still
+        # processes and averages them, so showing one again shows a settled
+        # trace rather than a restart.
+        self.hidden: set[int] = set()
+        self.active: int | None = None     # drawn on top of the others
         self._syncing = False          # guards the view <-> viewbox round trip
         # Reduction time, accumulated across every call in a frame and drained
         # by the frame loop.  It is counted here rather than at the call site
@@ -139,8 +144,22 @@ class SpectrumPlot(QtCore.QObject):
                     self._curves[ch] = self.plot.plot(
                         pen=pg.mkPen(CHANNEL_COLOURS.get(ch, "#c0c0c0"), width=1),
                         name=f"CH{ch}")
+                    self._curves[ch].setVisible(ch not in self.hidden)
+                    self._curves[ch].setZValue(2 if ch == self.active else 1)
         if self._legend is not None:
             self._legend.setVisible(multi)
+
+    def set_hidden(self, hidden):
+        self.hidden = set(hidden)
+        for ch, curve in self._curves.items():
+            curve.setVisible(ch not in self.hidden)
+
+    def set_active(self, ch: int | None):
+        """Raise the active channel's curve, so where traces overlap the one
+        the readouts are quoting is the one you can see."""
+        self.active = ch
+        for c, curve in self._curves.items():
+            curve.setZValue(2 if c == ch else 1)
 
     def redraw(self):
         t0 = time.perf_counter()
@@ -164,6 +183,8 @@ class SpectrumPlot(QtCore.QObject):
         if not self._specs:
             return
         for ch, spec in self._specs.items():
+            if ch in self.hidden and ch in self._curves:
+                continue                  # not drawn, so not worth reducing
             f, d = reduce_for_display(spec.freqs, spec.power_db, self.display_bins,
                                       fmin=self.view.lo, fmax=self.view.hi,
                                       detector=self.detector)

@@ -7,7 +7,8 @@ either over SCPI or — much faster — through an in-app *tap* injected into th
 scope's own process. The tap runs its capture loop there: it arms the scope,
 reads each capture with the app's own export functions, and sends every
 enabled channel to the PC, with no SCPI per frame. On a 1 Mpt record that is
-~16 fps for one channel and ~8.7 fps for two, overlaid on one plot.
+~17.5 fps for one channel, 8.8 for two, 5.9 for three and 4.4 for all four,
+overlaid on one plot.
 
 This started life as `fftdemo/` in the
 [mho-speed-patch](../rigol) repo and outgrew it. That repo still owns the speed
@@ -39,14 +40,14 @@ captures a frame and exits, which is how the smoke tests work.
 | `spectrum/fft_gui.py` | entry point: CLI, source construction, headless harness |
 | `spectrum/window.py` | the main window — wiring and the frame loop |
 | `spectrum/viewmodel.py` | `FreqView` / `AmpScale` — the axis arithmetic, Qt-free |
-| `spectrum/panels.py` | control groups: FREQ / AMPT / BW-DET / MARKER / VIEW |
+| `spectrum/panels.py` | control groups: FREQ / AMPT / BW-DET / TRACE / MARKER / VIEW |
 | `spectrum/plots.py` | the spectrum pane and the frame-timing strip |
-| `spectrum/markers.py` | markers, deltas, and the marker table |
+| `spectrum/markers.py` | markers (each on one channel's trace), deltas, and the marker table |
 | `spectrum/analysis.py` | peak search, ADC spur frequencies, CSV export |
 | `spectrum/spectrum.py` | `SpectrumEngine` — windowing, FFT, averaging, dB, detectors |
 | `spectrum/channels.py` | `ChannelEngines` — one engine per scope channel, driven as one |
 | `spectrum/sources.py` | interchangeable frame sources: `synthetic`, `scpi`, `stream`/`tap` |
-| `spectrum/stream_client.py` | wire protocol + listener for the on-scope tap; splits multi-channel frames |
+| `spectrum/stream_client.py` | wire protocol + listener for the on-scope tap; splits multi-channel frames and their per-channel scales |
 | `spectrum/frametime.py` | per-frame timing: where a slow frame went |
 | `spectrum/native_acq.py` | drives acquisition via `DrvAcquire_*` on the scope |
 | `device/tap_stream.py` | injects the tap, primes the scope, starts the capture loop |
@@ -62,7 +63,7 @@ captures a frame and exits, which is how the smoke tests work.
 
 `docs/SPECTRUM_ANALYSER_FEATURES.md` surveys what real spectrum analysers do
 (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, and the SDR tools) and
-scores all 199 features against this codebase: **54 Done, 19 Partial, 111
+scores all 199 features against this codebase: **54 Done, 20 Partial, 110
 Missing, 15 N/A on this hardware.** It ends with a five-phase build order.
 
 **Phase 1 — make the existing display honest and measurable — is done,** bar
@@ -77,8 +78,8 @@ scope required.
 **Phase 2 — traces, measurements and absolute units** is next: independent
 traces with the Active/View/Blank model and the measurement suite (channel
 power, OBW, THD, SFDR, SINAD/ENOB). Absolute units are partly there: the tap
-already carries the vertical scale and dBV/dBm (50 Ω) are offered, but the
-scale is read once at startup and the SCPI source has none.
+already carries each channel's vertical scale and dBV/dBm (50 Ω) are offered,
+but the scales are read once at startup and the SCPI source has none.
 
 Two findings worth knowing before you touch the code:
 
@@ -87,12 +88,14 @@ Two findings worth knowing before you touch the code:
   (hann 1.50, Blackman-Harris 2.00, flat-top 3.77, computed from the window
   itself rather than tabulated). Both are on screen, labelled differently.
   Anything claiming dBm/Hz, a noise marker or channel power must use the RBW.
-* **Absolute amplitude units depend on a scale sent once, at startup.**
-  `device/tap_stream.py` queries `yincrement`/`yorigin`/`yreference` over SCPI
-  before streaming and `device/libmhotap.c` carries them in every record header.
-  That lets the AMPT units box offer dBV and dBm (the latter assumes 50 Ω). The
-  scale is not refreshed if V/div changes mid-session, and the plain `scpi`
-  source does not pass it through, so it is dBFS-only.
+* **Absolute amplitude units depend on scales sent once, at startup.**
+  `device/tap_stream.py` queries each enabled channel's
+  `yincrement`/`yorigin`/`yreference` over SCPI before streaming and
+  `device/libmhotap.c` carries them with every record — in the header for one
+  channel, in a table after it for several, since each channel has its own
+  V/div. That lets the units box offer dBV and dBm (the latter assumes 50 Ω).
+  The scales are not refreshed if V/div changes mid-session, and the plain
+  `scpi` source does not pass them through, so it is dBFS-only.
 
 ## What this hardware can and cannot do
 
