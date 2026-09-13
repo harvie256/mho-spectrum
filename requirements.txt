@@ -2,7 +2,9 @@
 numpy
 scipy
 pyqtgraph
-PyQt5
+PyQt6                # PyQt5 also works, but qt-material's checkbox and
+                     # radio icons are broken on it (see run_fft.sh)
+qt-material          # dark theme; optional, the app falls back to native Qt
 
 # device/tap_stream.py (injecting the on-scope tap):
 frida>=17

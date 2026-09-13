@@ -453,13 +453,16 @@ class StreamSource(StreamServer):
     def __init__(self, host="0.0.0.0", port=5560, scope_ip=None, pc_host=None,
                  channel=1, fmt="WORD", scpi_ip=None, python=None,
                  drive_poll_ms=0.0, quiet_ui=False, drive_csv="",
-                 no_scpi_sleep=False, scpi_sleep_us=1000):
+                 no_scpi_sleep=False, scpi_sleep_us=1000,
+                 quiet_logd=False, sleep_consts=()):
         super().__init__(host, port)
         self.drive_poll_ms = drive_poll_ms
         self.drive_csv = drive_csv
         self.no_scpi_sleep = no_scpi_sleep
         self.scpi_sleep_us = scpi_sleep_us
         self.quiet_ui = quiet_ui
+        self.quiet_logd = quiet_logd
+        self.sleep_consts = list(sleep_consts or ())
         self.scope_ip = scope_ip
         self.pc_host = pc_host
         self.channel = channel
@@ -487,6 +490,10 @@ class StreamSource(StreamServer):
             cmd += ["--drive-poll-ms", str(self.drive_poll_ms)]
         if self.quiet_ui:
             cmd += ["--quiet-ui"]
+        if self.quiet_logd:
+            cmd += ["--quiet-logd"]
+        for spec in self.sleep_consts:
+            cmd += ["--sleep-const", spec]
         if self.drive_csv:
             cmd += ["--drive-csv", self.drive_csv]
         if self.no_scpi_sleep:

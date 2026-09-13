@@ -18,17 +18,17 @@ spectrum.reduce_for_display) -- that, not the FFT, is what makes it keep up.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
-from collections import deque
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from frametime import DISPLAY_FIELDS, SOURCE_FIELDS  # noqa: E402
-from spectrum import SpectrumEngine, WINDOWS, reduce_for_display  # noqa: E402
+from spectrum import DETECTORS, SpectrumEngine, WINDOWS  # noqa: E402
 
 
 def report_timing(args, src, ftlog, gcw=None, stall=None):
@@ -39,6 +39,12 @@ def report_timing(args, src, ftlog, gcw=None, stall=None):
     clean arrival ever reached the screen.
     """
     if ftlog is None or not ftlog.rows:
+        return
+    # Off unless asked for.  This is a development dump -- two tables, the five
+    # worst frames of each and the GC log -- and it is noise for anyone who
+    # just wants to look at a spectrum.  --timing-csv implies it, since asking
+    # for the raw rows means you want the analysis too.
+    if not (getattr(args, "timing_report", False) or args.timing_csv):
         return
     print()
     print(ftlog.report(DISPLAY_FIELDS))
@@ -67,6 +73,156 @@ def report_timing(args, src, ftlog, gcw=None, stall=None):
             print(f"wrote {n} source rows to {base}-source{ext}")
 
 
+# The scope-side changes the tap makes by default.  Everything here is measured
+# and restored on exit; the experimental flags below default to off.
+#
+# ADC_SETTLE is the one that had to be found the hard way.  CDrvScope::SetState
+# is 31.6 ms of a 76 ms acquisition cycle, and 20 ms of that is a fixed settling
+# wait inside CCalibration_ADC::DrvCalibration_SetAdcStary.  Halving it is worth
+# roughly 12.9 -> 14.8 fps.  Halving it *again* is not: at 5 ms the scope starts
+# handing back stale records (the receiver CRCs every frame and catches them),
+# so 10 ms is the floor, not a starting point for further trimming.
+#
+# The offset is a return-address-relative movz in the build shipped in
+# /data/app/com.rigol.scope-2/base.apk -- NOT the copy in the firmware image,
+# which is a different build.  A firmware update will move it; the patch checks
+# the instruction really is a movz holding 20000 before writing, so a stale
+# offset is refused and the run simply continues unpatched.
+# These were command-line flags during development.  They are fixed now: the
+# tuning they exposed was only ever useful while chasing the frame loop, and a
+# released analyser should not ask anyone to think about them.  The machinery
+# behind them is still live -- the on-screen timing strip and --timing-report
+# both use it.
+TIMING_KEEP = 20000        # frames of per-frame history to retain
+TIMING_WORST = 5           # worst frames listed by --timing-report
+TIMING_SPAN = 300          # frames shown in the on-screen interval strip
+STALL_MS = 0.0             # 0 = adaptive threshold from the running median
+
+ADC_SETTLE_SPEC = "0x3417fc:20000:10000"
+
+SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "mho-spectrum", "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(**kw) -> None:
+    """Best effort -- losing the remembered IP is not worth failing a run."""
+    try:
+        cur = load_settings()
+        cur.update(kw)
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(cur, f, indent=2)
+    except Exception:
+        pass
+
+
+# Module-level so the QApplication outlives whoever created it.  Without this
+# the object is collected as soon as the caller drops its reference, taking the
+# C++ instance with it, and the next widget dies with "Must construct a
+# QApplication before a QWidget".  PyQt5 tolerated it; PyQt6 does not.
+_APP = None
+
+
+def qt_app(themed: bool = True):
+    """The one QApplication, themed once.
+
+    Both the startup dialog and the window need it and either may run first,
+    so it is created here rather than at either call site -- Qt allows only
+    one instance.  qt-material is optional: without it the native look is
+    used, which is why the import is guarded rather than a hard requirement.
+
+    density_scale shrinks Material's default padding.  At the stock size the
+    analyser's soft-key rows and the FREQ/AMPT entry boxes no longer fit the
+    window without scrolling.
+    """
+    global _APP
+    from pyqtgraph.Qt import QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    _APP = app
+    if themed and not getattr(app, "_mho_themed", False):
+        try:
+            from qt_material import apply_stylesheet
+            apply_stylesheet(app, theme="dark_teal.xml",
+                             extra={"density_scale": "-2"})
+        except Exception as e:                       # not installed, or broken
+            print(f"(theme unavailable, using the native look: {e})")
+        # The window frame stays in the desktop's style on purpose.  It is not
+        # reachable from a stylesheet, and on GNOME Wayland Qt draws it itself
+        # from the palette/colour scheme -- setting both was tried and did not
+        # darken it, so the remaining options were forcing the whole desktop to
+        # prefer-dark or reimplementing the title bar frameless.  Neither is
+        # worth it for a frame.
+        app._mho_themed = True
+    return app
+
+
+SOURCE_CHOICES = [
+    ("tap",       "Live from the scope (fastest, ~15 fps)"),
+    ("scpi",      "Live over SCPI (slower, no injection)"),
+    ("synthetic", "Synthetic signal (no scope needed)"),
+    ("stream",    "Listen for a tap started elsewhere"),
+]
+
+
+def prompt_startup(source: str, ip: str, themed: bool = True):
+    """Ask which source to use and, where it needs one, the scope IP.
+
+    Returns (source, ip), or (None, None) if cancelled.  Defaults come from the
+    previous run so the common case is one Return press.
+
+    This creates the QApplication if there is not one yet: the source -- and
+    with it the tap injection -- is built before the window, so this dialog
+    runs first and run_gui reuses the instance rather than making a second.
+    """
+    from pyqtgraph.Qt import QtWidgets
+
+    qt_app(themed)
+    dlg = QtWidgets.QDialog()
+    dlg.setWindowTitle("MHO934 spectrum analyser")
+    form = QtWidgets.QFormLayout(dlg)
+
+    combo = QtWidgets.QComboBox()
+    for key, label in SOURCE_CHOICES:
+        combo.addItem(label, key)
+    keys = [k for k, _ in SOURCE_CHOICES]
+    combo.setCurrentIndex(keys.index(source) if source in keys else 0)
+    form.addRow("Source:", combo)
+
+    edit = QtWidgets.QLineEdit(ip)
+    edit.setPlaceholderText("192.168.0.10")
+    form.addRow("Scope IP:", edit)
+
+    SB = QtWidgets.QDialogButtonBox.StandardButton
+
+    def sync():
+        needs_ip = combo.currentData() in ("tap", "scpi")
+        edit.setEnabled(needs_ip)
+        buttons.button(SB.Ok).setEnabled(
+            bool(edit.text().strip()) or not needs_ip)
+
+    buttons = QtWidgets.QDialogButtonBox(SB.Ok | SB.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    form.addRow(buttons)
+    combo.currentIndexChanged.connect(sync)
+    edit.textChanged.connect(sync)
+    sync()
+    edit.setFocus()
+
+    if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+        return None, None
+    return combo.currentData(), edit.text().strip()
+
+
 def build(args):
     from sources import ScpiSource, StreamSource, SyntheticSource
     if args.source == "synthetic":
@@ -77,18 +233,15 @@ def build(args):
         if not args.host:
             raise SystemExit("--source scpi needs --host")
         return ScpiSource(args.host, channel=args.channel, fmt=args.format,
-                          points=args.points, rearm=not args.no_rearm,
-                          native_device=args.native_acq or None,
-                          fill_ms=args.fill_ms)
+                          points=args.points)
     return StreamSource(host=args.bind, port=args.port,
                         scope_ip=args.tap or None, pc_host=args.pc_host or None,
                         channel=args.channel, fmt=args.format,
                         scpi_ip=args.scpi_ip or None,
-                        drive_poll_ms=args.tap_poll_ms,
                         quiet_ui=args.tap_quiet_ui,
-                        drive_csv=args.tap_drive_csv,
                         no_scpi_sleep=args.tap_no_scpi_sleep,
-                        scpi_sleep_us=args.tap_scpi_sleep_us)
+                        quiet_logd=args.tap_quiet_logd,
+                        sleep_consts=[ADC_SETTLE_SPEC] if args.tap_adc_sleep else [])
 
 
 def run_headless(args, src, eng):
@@ -168,389 +321,59 @@ def run_headless(args, src, eng):
             for k in ("resyncs", "timeouts", "short", "stale", "repeats"):
                 if st.get(k):
                     extra += f"  {k} {st[k]}"
-            print(f"  {n:5d} frames  src {st['fps']:5.2f} fps  "
-                  f"{st['mbps']:6.2f} MB/s  dropped {st['dropped']}  "
-                  f"fft {np.median(fft_ms):5.1f} ms  "
-                  f"peak {spec.freqs[pk]/1e6:8.4f} MHz @ {spec.power_db[pk]:6.1f} dBFS"
-                  + extra)
+            # Headless only, and deliberately terse: one line every couple of
+            # seconds is a progress indicator, not a measurement.  The detail
+            # lives behind --timing-report.
+            print(f"  {n:5d} frames  {st['fps']:5.1f} fps  "
+                  f"peak {spec.freqs[pk]/1e6:8.4f} MHz @ "
+                  f"{spec.power_db[pk]:6.1f} dBFS" + extra)
             if st.get("warning") and st["warning"] != state_warn.get("last"):
                 state_warn["last"] = st["warning"]
                 print("    last warning:", st["warning"])
             last_report = time.time()
-    if fft_ms:
+    if fft_ms and (getattr(args, "timing_report", False) or args.timing_csv):
         print(f"\n{n} frames, fft median {np.median(fft_ms):.1f} ms "
               f"(p95 {np.percentile(fft_ms, 95):.1f} ms)")
     st = src.stats()
     extra = "".join(f", {st[k]} {k}" for k in
                     ("dropped", "repeats", "short", "resyncs", "timeouts")
                     if st.get(k))
-    print(f"source: {st['frames']} frames, {st['fps']:.2f} fps, "
-          f"{st['mbps']:.2f} MB/s{extra or ', clean'}")
+    # The trailing-window rate, not the whole-run mean: a run takes a few
+    # seconds to reach steady state and averaging over the ramp understates it
+    # (a 45 s run once read 12.70 fps cumulative against ~15 steady).  The
+    # cumulative figures are still in stats() as fps_avg/mbps_avg.
+    print(f"source: {st['frames']} frames, {st['fps']:.1f} fps, "
+          f"{st['mbps']:.1f} MB/s{extra or ', clean'}")
     if st.get("repeats"):
-        print(f"  {st['repeats']} stale reads were discarded before reaching the "
-              f"display; dwell settled at {st.get('fill_ms', 0):.0f} ms "
-              f"(--native-acq avoids this entirely)")
+        print(f"  {st['repeats']} stale reads were discarded before reaching "
+              f"the display")
     gcw.remove()
     report_timing(args, src, ftlog, gcw, stall)
 
 
 def run_gui(args, src, eng):
+    """Build the window and hand control to Qt.
+
+    Everything that used to live in this function is now in window.py and the
+    modules under it; what is left is the process-level bracket -- Qt setup,
+    and the teardown that has to happen after the event loop returns whether it
+    exited cleanly or not.
+    """
     import pyqtgraph as pg
-    from pyqtgraph.Qt import QtCore, QtWidgets
+    from pyqtgraph.Qt import QtWidgets
 
-    from frametime import (DISPLAY_FIELDS, FrameLog, GCWatch, StallDetector,
-                           nivcsw, stall_line, thread_cpu)
-
-    class TimedPlotWidget(pg.PlotWidget):
-        """A PlotWidget that adds up the time Qt spends repainting it.
-
-        The repaint happens *after* the timer callback returns, so it is
-        invisible to any stopwatch inside tick() -- yet it runs on the same
-        thread and is therefore inside the frame interval.  Left unmeasured it
-        would show up as unexplained idle time, which is exactly the bucket we
-        are trying to keep meaningful.
-        """
-
-        paint_s = 0.0                      # class-wide: totals every plot
-
-        def paintEvent(self, ev):
-            t0 = time.perf_counter()
-            try:
-                super().paintEvent(ev)
-            finally:
-                TimedPlotWidget.paint_s += time.perf_counter() - t0
+    from window import SpectrumWindow
 
     pg.setConfigOptions(antialias=False, useOpenGL=False)
-    app = QtWidgets.QApplication([])
-    win = QtWidgets.QMainWindow()
-    win.setWindowTitle("MHO934 live spectrum")
-    central = QtWidgets.QWidget()
-    win.setCentralWidget(central)
-    layout = QtWidgets.QVBoxLayout(central)
-    layout.setContentsMargins(6, 6, 6, 6)
-
-    # -- controls ---------------------------------------------------------
-    bar = QtWidgets.QHBoxLayout()
-    win_box = QtWidgets.QComboBox(); win_box.addItems(WINDOWS)
-    win_box.setCurrentText(args.window)
-    avg_box = QtWidgets.QSpinBox(); avg_box.setRange(1, 64); avg_box.setValue(args.average)
-    peak_chk = QtWidgets.QCheckBox("peak hold")
-    logx_chk = QtWidgets.QCheckBox("log freq")
-    reset_btn = QtWidgets.QPushButton("reset avg/peak")
-    dc_btn = QtWidgets.QPushButton("capture DC")
-    dc_clear_btn = QtWidgets.QPushButton("clear DC")
-    span_btn = QtWidgets.QPushButton("full span")
-    signal_btn = QtWidgets.QPushButton("zoom to signal")
-    timing_chk = QtWidgets.QCheckBox("frame timing")
-    timing_chk.setChecked(bool(args.timing_strip))
-    for label, w in (("window", win_box), ("average", avg_box),
-                     (None, peak_chk), (None, logx_chk), (None, reset_btn),
-                     (None, dc_btn), (None, dc_clear_btn), (None, span_btn),
-                     (None, signal_btn), (None, timing_chk)):
-        if label:
-            bar.addWidget(QtWidgets.QLabel(label))
-        bar.addWidget(w)
-    bar.addStretch(1)
-    layout.addLayout(bar)
-
-    plot = TimedPlotWidget()
-    plot.setLabel("bottom", "Frequency", units="Hz")
-    plot.setLabel("left", "Power", units="dBFS")
-    plot.showGrid(x=True, y=True, alpha=0.3)
-    plot.setYRange(-160, 5)
-    curve = plot.plot(pen=pg.mkPen("#1f9bd1", width=1))
-    layout.addWidget(plot, 1)
-
-    # -- frame-interval strip ---------------------------------------------
-    # A stall is a tail event: it never shows in the fps number, but it is
-    # unmistakable as a spike here.  Wall interval and the GUI thread's CPU time
-    # over the same interval are drawn together on purpose -- a spike with CPU
-    # following it is work, a spike with CPU flat along the bottom is the thread
-    # not running at all.
-    strip = TimedPlotWidget()
-    strip.setMaximumHeight(150)
-    strip.setLabel("left", "frame time, ms")
-    strip.setLabel("bottom", "frames ago")
-    strip.showGrid(x=False, y=True, alpha=0.3)
-    strip.setMouseEnabled(x=False, y=False)
-    strip.hideButtons()
-    # Log y, because that is the shape of the problem: a 2 s stall next to a
-    # 90 ms frame flattens a linear axis into a baseline and a spike, and the
-    # baseline is where the ordinary jitter lives.
-    strip.setLogMode(x=False, y=True)
-    strip.addLegend(offset=(70, 4), labelTextSize="8pt",
-                    horSpacing=12, verSpacing=-4)
-    iv_curve = strip.plot(pen=pg.mkPen("#e0b040", width=1), name="interval")
-    cpu_curve = strip.plot(pen=pg.mkPen("#48a860", width=1), name="GUI cpu")
-    src_curve = strip.plot(pen=pg.mkPen("#8060c0", width=1, style=QtCore.Qt.PenStyle.DashLine),
-                           name="source gap")
-    limit_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("#c04040", width=1,
-                                 style=QtCore.Qt.PenStyle.DashLine))
-    strip.addItem(limit_line)
-    strip.setVisible(bool(args.timing_strip))
-    layout.addWidget(strip)
-
-    status = QtWidgets.QLabel("waiting for first frame...")
-    status.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-    layout.addWidget(status)
-
-    state = {"draws": 0, "t0": time.perf_counter(), "fft_ms": 0.0, "last": "",
-             "spec": None, "frame": None, "nyquist": 0.0, "ranged": False}
-
-    # -- frame-time instrumentation ---------------------------------------
-    # One record per displayed frame, decomposing the interval since the last
-    # one into work / paint / idle, with the GUI thread's own CPU time over the
-    # same window so starvation is distinguishable from doing too much.
-    ftlog = FrameLog("display", DISPLAY_FIELDS, capacity=args.timing_keep)
-    gcw = GCWatch().install()
-    stall = StallDetector(threshold_ms=args.stall_ms)
-    tmr = {"last_end": time.perf_counter(), "last_cpu": thread_cpu(),
-           "last_paint": 0.0, "last_ivcsw": nivcsw(), "last_recv": None,
-           "last_dropped": 0, "work_s": 0.0, "draw_s": 0.0, "empty": 0,
-           "iv": deque(maxlen=args.timing_span),
-           "cpu": deque(maxlen=args.timing_span),
-           "src": deque(maxlen=args.timing_span)}
-
-    def on_reset():
-        eng.reset()
-    reset_btn.clicked.connect(on_reset)
-
-    def on_capture_dc():
-        frame = state["frame"]
-        if frame is None:
-            return
-        eng.capture_dc(frame.samples)
-        if state["spec"] is not None:
-            state["spec"] = eng.process(frame.samples, frame.sample_rate)
-            redraw()
-    dc_btn.clicked.connect(on_capture_dc)
-
-    def on_clear_dc():
-        eng.clear_dc()
-    dc_clear_btn.clicked.connect(on_clear_dc)
-
-    def on_full_span():
-        if state["nyquist"]:
-            lo = state["spec"].resolution if logx_chk.isChecked() else 0.0
-            plot.setXRange(np.log10(max(lo, 1.0)) if logx_chk.isChecked() else 0.0,
-                           np.log10(state["nyquist"]) if logx_chk.isChecked()
-                           else state["nyquist"], padding=0.0)
-    span_btn.clicked.connect(on_full_span)
-
-    def set_span(lo, hi):
-        if logx_chk.isChecked():
-            lo = max(lo, 1.0)
-            plot.setXRange(np.log10(lo), np.log10(max(hi, lo * 10)), padding=0.0)
-        else:
-            plot.setXRange(lo, hi, padding=0.0)
-
-    def on_zoom_signal():
-        """Frame the actual signal.
-
-        At 2 GSa/s the Nyquist is 1 GHz, so a 200 kHz tone sits in the leftmost
-        0.02% of a full-span view and is effectively invisible.  Pick the span
-        from where the energy actually is, ignoring DC.
-        """
-        spec = state["spec"]
-        if spec is None:
-            return
-        skip = max(1, int(1e3 / spec.resolution))      # ignore DC and near-DC
-        pk = int(np.argmax(spec.power_db[skip:])) + skip
-        f_pk = float(spec.freqs[pk])
-        hi = min(max(f_pk * 8.0, 10 * spec.resolution), float(spec.freqs[-1]))
-        set_span(spec.resolution, hi)
-    signal_btn.clicked.connect(on_zoom_signal)
-
-    def on_logx(v):
-        plot.setLogMode(x=bool(v), y=False)
-        on_full_span()
-    logx_chk.stateChanged.connect(on_logx)
-
-    def visible_span():
-        """Current x view in Hz (the view is log10(Hz) when log mode is on)."""
-        (x0, x1), _ = plot.getViewBox().viewRange()
-        if logx_chk.isChecked():
-            x0, x1 = 10.0 ** x0, 10.0 ** x1
-        return max(0.0, x0), x1
-
-    def redraw():
-        # Timed here rather than in tick() because a user zoom or pan re-enters
-        # this through sigXRangeChanged, and that cost belongs to the frame
-        # interval it lands in just as much as the per-frame redraw does.
-        t_draw = time.perf_counter()
-        try:
-            _redraw()
-        finally:
-            tmr["draw_s"] += time.perf_counter() - t_draw
-
-    def _redraw():
-        spec = state["spec"]
-        if spec is None:
-            return
-        lo, hi = visible_span()
-        # Reduce over the *visible* span, so zooming re-reduces from full
-        # resolution instead of magnifying coarse buckets.
-        f, d = reduce_for_display(spec.freqs, spec.power_db, args.display_bins,
-                                  fmin=lo, fmax=hi)
-        if logx_chk.isChecked():
-            keep = f > 0          # log-x cannot show DC
-            f, d = f[keep], d[keep]
-        curve.setData(f, d)
-
-    # Re-reduce when the user zooms or pans, not only when a frame arrives.
-    plot.getViewBox().sigXRangeChanged.connect(lambda *_: redraw())
-
-    def tick():
-        t_tick = time.perf_counter()
-        eng.set_window(win_box.currentText())
-        eng.averaging = avg_box.value()
-        eng.peak_hold = peak_chk.isChecked()
-
-        t_get = time.perf_counter()
-        frame = src.get(timeout=0.0)
-        get_ms = (time.perf_counter() - t_get) * 1e3
-        if frame is None:
-            st = src.stats()
-            if not getattr(src, "tap_alive", lambda: True)():
-                tail = src.tap_log_tail(3).strip().replace("\n", " | ")
-                status.setText(f"on-scope tap exited: {tail[:180]}")
-                return
-            msg = st.get("error") or st.get("warning")
-            if msg and msg != state["last"]:
-                state["last"] = msg
-                kind = "error" if st.get("error") else "waiting"
-                status.setText(f"source {kind}: {msg}")
-            # An empty poll is the timer running while the source has nothing.
-            # Counting them separates "waiting for the scope" from "blocked",
-            # which is the whole question a stall raises.
-            tmr["empty"] += 1
-            tmr["work_s"] += time.perf_counter() - t_tick
-            return
-        t0 = time.perf_counter()
-        spec = eng.process(frame.samples, frame.sample_rate)
-        state["fft_ms"] = (time.perf_counter() - t0) * 1e3
-        state["spec"] = spec
-        state["frame"] = frame
-
-        nyq = float(spec.freqs[-1])
-        if not state["ranged"] or abs(nyq - state["nyquist"]) > 1.0:
-            # Fix the x range once so setData cannot feed autorange back into
-            # sigXRangeChanged and cause a redraw loop.
-            state["nyquist"] = nyq
-            state["ranged"] = True
-            plot.enableAutoRange(x=False)
-            if args.fmax:
-                set_span(spec.resolution if logx_chk.isChecked() else 0.0,
-                         min(args.fmax, nyq))
-            else:
-                # Default to framing the signal rather than the full Nyquist:
-                # full span buries a low-frequency tone in the first pixel.
-                on_zoom_signal()
-        redraw()
-
-        # -- close out the frame interval ---------------------------------
-        # The boundary is the end of the redraw, so every piece of the window
-        # belongs to exactly one interval: this tick's own work, the empty polls
-        # and repaint that preceded it, and whatever is left over.
-        end = time.perf_counter()
-        cpu_end = thread_cpu()
-        ivcsw_end = nivcsw()
-        paint_now = TimedPlotWidget.paint_s
-
-        draw_ms = tmr["draw_s"] * 1e3
-        tmr["draw_s"] = 0.0
-        interval_ms = (end - tmr["last_end"]) * 1e3
-        cpu_ms = (cpu_end - tmr["last_cpu"]) * 1e3
-        paint_ms = (paint_now - tmr["last_paint"]) * 1e3
-        work_ms = tmr["work_s"] * 1e3 + (end - t_tick) * 1e3
-        _gc_n, gc_ms = gcw.between(tmr["last_end"], end)
-        st = src.stats()
-        row = ftlog.record(
-            t=end,
-            interval_ms=interval_ms,
-            cpu_ms=cpu_ms,
-            work_ms=work_ms,
-            paint_ms=paint_ms,
-            idle_ms=max(0.0, interval_ms - work_ms - paint_ms),
-            get_ms=get_ms,
-            fft_ms=state["fft_ms"],
-            draw_ms=draw_ms,
-            status_ms=tmr.get("status_ms", 0.0),
-            gc_ms=gc_ms,
-            age_ms=(end - frame.recv_time) * 1e3,
-            src_gap_ms=((frame.recv_time - tmr["last_recv"]) * 1e3
-                        if tmr["last_recv"] else 0.0),
-            empty_ticks=tmr["empty"],
-            nivcsw=ivcsw_end - tmr["last_ivcsw"],
-            dropped=st.get("dropped", 0) - tmr["last_dropped"],
-            base_ms=stall.median,          # what "normal" was, for explain()
-            seq=frame.seq)
-        if stall.check(interval_ms):
-            print(stall_line(row, state["t0"]), flush=True)
-        tmr.update(last_end=end, last_cpu=cpu_end, last_paint=paint_now,
-                   last_ivcsw=ivcsw_end, last_recv=frame.recv_time,
-                   last_dropped=st.get("dropped", 0), work_s=0.0, empty=0)
-
-        t_status = time.perf_counter()
-        state["draws"] += 1
-        el = end - state["t0"]
-        pk = int(np.argmax(spec.power_db))
-        tmr["iv"].append(interval_ms)
-        tmr["cpu"].append(cpu_ms)
-        tmr["src"].append(row["src_gap_ms"])
-        if strip.isVisible():
-            n = len(tmr["iv"])
-            x = np.arange(-n + 1, 1)
-            # Log mode cannot plot a zero, and both cpu_ms and the first
-            # frame's source gap legitimately reach it.  Clamp at 1 ms rather
-            # than at epsilon: a single 0 would otherwise stretch the axis over
-            # three decades of nothing and squash the band that matters.
-            def _pos(seq):
-                return np.maximum(np.fromiter(seq, float, n), 1.0)
-            iv_curve.setData(x, _pos(tmr["iv"]))
-            cpu_curve.setData(x, _pos(tmr["cpu"]))
-            src_curve.setData(x, _pos(tmr["src"]))
-            limit_line.setValue(np.log10(max(stall.limit(), 1.0)))
-        status.setText(
-            f"{frame.npoints:,} pts @ {frame.sample_rate/1e6:.1f} MSa/s  ·  "
-            f"{spec.resolution:.0f} Hz/bin  ·  "
-            f"src {st['fps']:.2f} fps, {st['mbps']:.1f} MB/s, {st['dropped']} dropped"
-            + (f", {st['repeats']} STALE" if st.get("repeats") else "") + "  ·  "
-            f"draw {state['draws']/el:.1f} fps  ·  fft {state['fft_ms']:.0f} ms  ·  "
-            f"frame {interval_ms:.0f} ms (med {stall.median:.0f}, "
-            f"worst {stall.worst:.0f}, {stall.count} stalls)  ·  "
-            f"peak {spec.freqs[pk]/1e6:.4f} MHz @ {spec.power_db[pk]:.1f} dBFS"
-            + (f"  ·  DC cal {eng.dc_offset:+.0f} codes" if eng.dc_offset else ""))
-        # Building the status line lands after the interval boundary, so carry
-        # it into the next interval rather than losing it.
-        tmr["status_ms"] = (time.perf_counter() - t_status) * 1e3
-        tmr["work_s"] = tmr["status_ms"] / 1e3
-
-    timing_chk.stateChanged.connect(lambda v: strip.setVisible(bool(v)))
-
-    timer = QtCore.QTimer()
-    timer.timeout.connect(tick)
-    timer.start(args.poll_ms)
-
-    if args.run_seconds:
-        def _finish():
-            print(status.text())
-            if args.screenshot:
-                # Grab before quitting: the window has to still exist, and
-                # widget.grab() renders it directly rather than going through
-                # a compositor, so it works under Wayland with no helper tool.
-                win.grab().save(args.screenshot)
-                print(f"saved {args.screenshot}")
-            app.quit()
-        QtCore.QTimer.singleShot(int(args.run_seconds * 1000), _finish)
-
-    win.resize(1200, 760)
+    app = qt_app(not args.no_theme)
+    win = SpectrumWindow(args, src, eng, app)
+    win.start()
     win.show()
     try:
         app.exec()
     finally:
-        gcw.remove()
-        report_timing(args, src, ftlog, gcw, stall)
+        win.teardown()
+        report_timing(args, src, win.ftlog, win.gcw, win.stall)
         src.stop()
         # let the source thread detach cleanly (frida) before we exit
         t = getattr(src, "_thread", None)
@@ -558,7 +381,10 @@ def run_gui(args, src, eng):
             t.join(timeout=3.0)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI.  Split out of main() so tests/acq_sweep.py builds its sources
+    from exactly the defaults a normal run gets, rather than a copy of them
+    that drifts the next time one is flipped."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", choices=("synthetic", "scpi", "stream"),
                     default="synthetic")
@@ -568,6 +394,11 @@ def main():
                     help="launch the on-scope tap too (implies --source stream): "
                          "injects libmhotap.so and streams records straight out "
                          "of the app, bypassing the SCPI reply path")
+    ap.add_argument("--choose", action="store_true",
+                    help="pick the source and scope IP in a dialog, defaulting "
+                         "to whatever was used last time.  This is what "
+                         "`run_fft.sh` with no arguments does; with --headless "
+                         "it silently reuses the remembered settings")
     ap.add_argument("--pc-host", default="",
                     help="this PC as the scope sees it (default: auto-detect)")
     ap.add_argument("--scpi-ip", default="",
@@ -576,15 +407,6 @@ def main():
     ap.add_argument("--channel", type=int, default=1)
     ap.add_argument("--format", default="WORD", choices=("WORD", "BYTE"))
     ap.add_argument("--points", type=int, default=0, help="0 = full record")
-    ap.add_argument("--native-acq", default="", metavar="IP:PORT",
-                    help="drive acquisition via DrvAcquire_* on the scope "
-                         "(adb device id, e.g. 172.30.188.217:55555). Faster "
-                         "than :RUN/:STOP and guarantees each record is new; "
-                         "needs frida-server (patch_scope.py provisions it)")
-    # On by default: the scope's own plot thread is ~60% of a core on a box
-    # whose big cores are saturated, and while the spectrum is on the PC its
-    # screen is not earning that.  Worth ~2 fps and it removes the stalls, so
-    # the demo should not need to be told.  Restored when the tap exits.
     ap.add_argument("--no-tap-quiet-ui", dest="tap_quiet_ui",
                     action="store_false",
                     help="leave the scope redrawing its own waveform while "
@@ -592,14 +414,19 @@ def main():
                          "stalls; the default is to pause it and restore it "
                          "on exit)")
     ap.set_defaults(tap_quiet_ui=True)
-    ap.add_argument("--fill-ms", type=float, default=0.0,
-                    help="override the :RUN dwell before :STOP, in ms "
-                         "(SCPI arming only; too short silently re-reads)")
-    ap.add_argument("--no-rearm", action="store_true",
-                    help="re-read the stored record without re-acquiring (faster, static)")
     ap.add_argument("--window", default="hann", choices=WINDOWS)
     ap.add_argument("--average", type=int, default=1)
     ap.add_argument("--display-bins", type=int, default=2000)
+    ap.add_argument("--detector", default="+peak", choices=DETECTORS,
+                    help="bin-to-pixel reduction (default +peak). Use rms for "
+                         "any noise or channel-power number: +peak overstates "
+                         "noise, and sample and avg-log read ~2.5 dB low on it")
+    ap.add_argument("--ref-level", type=float, default=0.0, metavar="DBFS",
+                    help="top of the graticule in dBFS; giving this (or "
+                         "--db-per-div) pins the amplitude axis instead of "
+                         "auto-scaling it from each frame")
+    ap.add_argument("--db-per-div", type=float, default=0.0,
+                    help="vertical scale, over a 10-division graticule")
     ap.add_argument("--fmax", type=float, default=0.0,
                     help="initial upper frequency of the view, in Hz "
                          "(default: auto-frame the strongest signal)")
@@ -609,28 +436,13 @@ def main():
                     help="display timer period in ms (how often the source is "
                          "polled; also the floor on frame-to-frame jitter)")
     tg = ap.add_argument_group("frame timing")
-    tg.add_argument("--stall-ms", type=float, default=0.0,
-                    help="report a frame as a stall above this interval in ms "
-                         "(0 = adapt: 2.5x the running median, floor +20 ms)")
+    tg.add_argument("--timing-report", action="store_true",
+                    help="print the per-frame timing breakdown on exit "
+                         "(display and source tables, worst frames, GC). "
+                         "Implied by --timing-csv")
     tg.add_argument("--timing-csv", default="",
                     help="on exit, dump per-frame rows here (a -source.csv "
                          "companion gets the source-thread rows)")
-    tg.add_argument("--timing-keep", type=int, default=20000,
-                    help="how many per-frame records to retain")
-    tg.add_argument("--timing-worst", type=int, default=5,
-                    help="how many slowest frames to detail on exit")
-    tg.add_argument("--timing-span", type=int, default=300,
-                    help="frames shown in the live frame-interval strip")
-    tg.add_argument("--tap-poll-ms", type=float, default=0.0,
-                    help="with --tap: sample the on-scope capture loop this "
-                         "often and log slow cycles to the tap log (100 is a "
-                         "good value).  Diagnostic only -- the extra Frida RPC "
-                         "costs the scope ~2 fps, so leave it off when the "
-                         "frame rate itself is what is being measured")
-    # On by default, like --tap-quiet-ui: the app sleeps a hardcoded 20 ms
-    # before answering any SCPI command and the tap pays it once per frame,
-    # which is ~23% of the cycle spent asleep.  Worth 11.3 -> 13.9 fps, and
-    # restored when the tap exits, so the demo should not need to be told.
     tg.add_argument("--tap-keep-scpi-sleep", dest="tap_no_scpi_sleep",
                     action="store_false",
                     help="leave the app's hardcoded 20 ms per-SCPI-command "
@@ -638,14 +450,34 @@ def main():
                          "shorten it to --tap-scpi-sleep-us and restore it "
                          "on exit)")
     tg.set_defaults(tap_no_scpi_sleep=True)
-    tg.add_argument("--tap-scpi-sleep-us", type=int, default=1000,
-                    help="what --tap-no-scpi-sleep shortens the app's 20 ms "
-                         "per-command wait to (default 1000; 0 removes it)")
-    tg.add_argument("--tap-drive-csv", default="",
-                    help="with --tap-poll-ms: per-cycle on-scope phase times")
+    # On by default for the same reason as the other two: the scope's logging
+    # is the largest non-app CPU consumer while streaming, and none of it is
+    # wanted during a measurement.  Measured 2026-09-09: 0.62 of a core back,
+    # 88.8% -> 81.7% busy, 12.5 -> 13.4 fps.  logd is restarted on exit.
+    tg.add_argument("--tap-keep-logd", dest="tap_quiet_logd",
+                    action="store_false",
+                    help="leave the scope's logd running.  By default the tap "
+                         "stops it for the session (worth ~0.6 of a core) and "
+                         "starts it again on exit; use this if you need the "
+                         "scope's logs while streaming")
+    tg.set_defaults(tap_quiet_logd=True)
+    # On by default, alongside the redraw pause, the SCPI sleep and logd.
+    # Those four are the whole set of scope-side changes, all measured and all
+    # restored on exit.
+    tg.add_argument("--tap-keep-adc-sleep", dest="tap_adc_sleep",
+                    action="store_false",
+                    help="leave the ADC settling wait at its stock 20 ms. By "
+                         f"default it is patched to 10 ms ({ADC_SETTLE_SPEC}), "
+                         "worth ~2 fps; 5 ms was tried and returns stale records")
+    # TEMPORARILY OFF (2026-09-13) while checking whether shortening the ADC
+    # settling wait is behind the occasional stalls.  Flip back to True to
+    # restore it -- it is worth ~2 fps.
+    tg.set_defaults(tap_adc_sleep=False)
     tg.add_argument("--no-timing-strip", dest="timing_strip",
                     action="store_false", help="hide the frame-interval strip")
     tg.set_defaults(timing_strip=True)
+    ap.add_argument("--no-theme", action="store_true",
+                    help="use the native Qt look instead of the dark theme")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--run-seconds", type=float, default=0.0,
                     help="close the window after N seconds (demos, smoke tests)")
@@ -653,9 +485,47 @@ def main():
                     help="save a PNG of the window just before --run-seconds "
                          "closes it")
     ap.add_argument("--seconds", type=float, default=0.0)
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
+    # Former flags, see the constants at the top of this file.
+    args.stall_ms = STALL_MS
+    args.timing_keep = TIMING_KEEP
+    args.timing_worst = TIMING_WORST
+    args.timing_span = TIMING_SPAN
+
+    # With no source on the command line, ask.  The point of the dialog is
+    # that the common case needs no arguments at all: it opens on whatever was
+    # used last (tap the first time) and one Return starts it.
+    cfg = load_settings()
+    if args.choose:
+        chosen_ip = cfg.get("scope_ip", "")
+        if args.headless:
+            # No dialog without a display; reuse what was remembered so
+            # unattended runs still work.
+            args.source = cfg.get("source", "tap")
+        else:
+            args.source, chosen_ip = prompt_startup(cfg.get("source", "tap"),
+                                                    chosen_ip,
+                                                    not args.no_theme)
+            if args.source is None:
+                return                                  # cancelled
+            save_settings(source=args.source)
+            if chosen_ip:
+                save_settings(scope_ip=chosen_ip)
+        if args.source in ("tap", "scpi") and not chosen_ip:
+            raise SystemExit("no scope IP: give one, e.g. --tap 192.168.0.10")
+        if args.source == "tap":
+            args.tap = chosen_ip
+        elif args.source == "scpi":
+            args.host = chosen_ip
+
     if args.tap:
         args.source = "stream"
+        if args.tap != cfg.get("scope_ip", ""):
+            save_settings(scope_ip=args.tap, source="tap")
 
     eng = SpectrumEngine(window=args.window, averaging=args.average)
     src = build(args).start()

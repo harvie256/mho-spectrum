@@ -4,7 +4,8 @@
  * WHY: the SCPI reply path costs ~110 ms per 1 Mpt frame -- the app marshals
  * the record into an RByteArray (28.5 MB/s even patched) and frames it as a
  * SCPI block before a byte reaches the wire.  But CApiWave::toFormat already
- * receives a pointer to the COMPLETE record.  Copying 2 MB out of that pointer
+ * receives a pointer to the record -- whole up to 1 Mpt, and in 1 Mpt chunks
+ * above that (see mhotap_frame).  Copying 2 MB out of that pointer
  * costs ~1.5 ms at DRAM speed, so if we take it there and send it ourselves the
  * entire produce-and-frame path becomes dead weight and can be skipped.
  *
@@ -57,11 +58,28 @@ static struct {
 
     uint32_t         seq;
     double           srate;
+    /* Vertical scale, so the PC can show absolute units instead of dBFS.
+     * volts = (code - yref) * yinc + yorig, the SCPI convention.  Zero means
+     * "unknown" and the receiver stays in dBFS. */
+    double           yinc, yorig, yref;
     int              bps;
+
+    /* Record assembly.  Above 1 Mpt the app does not hand toWord the whole
+     * record: it calls it once per 1 Mpt chunk, in order (measured 2026-09-13
+     * at 10 M: 10 calls of 1,000,000 contiguous points per :WAV:DATA?).
+     * Shipping each call as a frame labelled with the record's sample rate is
+     * what put a 1 MHz tone at 10 MHz.  So chunks are copied straight into one
+     * slot until rec_bytes have arrived, and only a whole record is published.
+     * rec_bytes == 0 keeps one call = one frame. */
+    long             rec_bytes;
+    long             fill_len;       /* bytes of the record in slots[head] so far */
+    int              fill_skip;      /* ring was full at record start: discard it */
+    unsigned long    records_done;   /* completed, whether published or skipped */
 
     /* stats */
     unsigned long    frames_in, frames_sent, frames_dropped, bytes_sent;
     unsigned long    send_errors;
+    unsigned long    chunks_in, partial_records;
     double           t0;
 } G;
 
@@ -83,8 +101,13 @@ static int send_all(int fd, const void *buf, size_t n) {
     return 0;
 }
 
+
 static void *sender_main(void *arg) {
     (void)arg;
+    /* Named so it can be told apart in cpuwatch/top: an unnamed pthread here
+     * inherits whatever created it (a frida thread), which made it impossible
+     * to see which core the encode and the send were landing on. */
+    pthread_setname_np(pthread_self(), "mhotap-send");
     unsigned char hdr[HDR_BYTES];
     for (;;) {
         pthread_mutex_lock(&G.m);
@@ -96,12 +119,18 @@ static void *sender_main(void *arg) {
         uint32_t seq = sl->seq;
         pthread_mutex_unlock(&G.m);
 
+
         memset(hdr, 0, sizeof hdr);
         memcpy(hdr, MAGIC, 8);
         uint32_t u32 = seq;                            memcpy(hdr + 8,  &u32, 4);
         u32 = (uint32_t)(len / (G.bps ? G.bps : 2));   memcpy(hdr + 12, &u32, 4);
         uint16_t u16 = (uint16_t)G.bps;                memcpy(hdr + 16, &u16, 2);
         double d = G.srate;                            memcpy(hdr + 24, &d, 8);
+        /* 32 is x-increment, unused.  40/48/56 are the vertical scale the
+         * receiver needs for dBV/dBm; left at zero they mean "unknown". */
+        d = G.yinc;                                    memcpy(hdr + 40, &d, 8);
+        d = G.yorig;                                   memcpy(hdr + 48, &d, 8);
+        d = G.yref;                                    memcpy(hdr + 56, &d, 8);
 
         if (send_all(G.fd, hdr, HDR_BYTES) != 0 ||
             send_all(G.fd, sl->buf, (size_t)len) != 0) {
@@ -150,6 +179,13 @@ static struct {
     long         last_declared;
     int          arm_mode;         /* 0 = SINGLE, 1 = RUN/dwell/STOP */
     int          dwell_us;
+    int          reply_ms;         /* reply-header and record wait, by depth */
+    int          wait_record;      /* record spans several toWord calls */
+    int          settle_us;        /* pinned delay before the read; 0 = adaptive */
+    int          auto_settle_us, settle_hi_us, settle_lo_us;
+    int          good_run, fail_run;
+    unsigned long recoveries;      /* fell back to settle_hi after a broken record */
+    unsigned long incomplete;      /* cycles re-armed before the record completed */
 } D;
 
 static int recv_some(int fd, void *b, size_t n, int ms) {
@@ -175,16 +211,23 @@ static int recv_some(int fd, void *b, size_t n, int ms) {
  * Waiting longer costs nothing when the reply is prompt -- the wait ends when
  * the data arrives, not when the timeout expires. */
 #define REPLY_HDR_MS 120
+/* ...plus this per Mpt beyond the first.  A deeper record is produced in 1 Mpt
+ * chunks and its reply is slower: the header arrived after 114-170 ms at 10 M
+ * (measured 2026-09-13), so a flat 120 ms abandoned about half of them -- and
+ * an abandoned reply re-arms the acquisition while the app is still reading
+ * the record out, which overwrote the chunk in flight with a decimated trace.
+ * 1 M keeps exactly the 120 ms measured above. */
+#define REPLY_MS_PER_MPT 30
 
-static long drain_reply(int fd) {
+static long drain_reply(int fd, int hdr_ms) {
     char sink[4096];
     long declared = -1;
-    int k = recv_some(fd, sink, 2, REPLY_HDR_MS);  /* '#' + ndigits */
+    int k = recv_some(fd, sink, 2, hdr_ms);  /* '#' + ndigits */
     if (k == 2 && sink[0] == '#') {
         int ndig = sink[1] - '0';
         if (ndig >= 1 && ndig <= 9) {
             char lb[16] = {0};
-            if (recv_some(fd, lb, ndig, REPLY_HDR_MS) == ndig)
+            if (recv_some(fd, lb, ndig, hdr_ms) == ndig)
                 declared = atol(lb);
         }
     }
@@ -195,8 +238,52 @@ static long drain_reply(int fd) {
     return declared;
 }
 
+/* Start of a new record.  Anything half-assembled belongs to a reply that was
+ * abandoned, so it is counted and dropped rather than spliced onto this one.
+ * Returns the completed-record count to wait past. */
+static unsigned long record_begin(void) {
+    if (!G.running) return G.records_done;
+    pthread_mutex_lock(&G.m);
+    if (G.fill_len) { G.partial_records++; G.fill_len = 0; }
+    unsigned long done = G.records_done;
+    pthread_mutex_unlock(&G.m);
+    return done;
+}
+
+/* The read delay for chunked records -- see the settle note in driver_main.
+ * Per Mpt of depth: the 10 M values are measured, the scaling to other depths
+ * is an assumption, which is why a failing settle_hi escalates on its own. */
+#define SETTLE_HI_US_PER_MPT 20000   /* 200 ms at 10 M: recovered every time */
+#define SETTLE_LO_US_PER_MPT  4000   /* 40 ms at 10 M: 2x the lowest that held */
+#define SETTLE_MAX_US       2000000
+#define SETTLE_GOOD_RUN           3  /* whole records at hi before dropping to lo */
+#define SETTLE_FAIL_RUN           5  /* broken records at hi before doubling it */
+
+static void settle_adapt(int whole) {
+    if (whole) {
+        D.fail_run = 0;
+        if (++D.good_run >= SETTLE_GOOD_RUN) D.auto_settle_us = D.settle_lo_us;
+        return;
+    }
+    D.good_run = 0;
+    if (D.auto_settle_us != D.settle_hi_us) {
+        /* lo broke: recover at hi, and do not trust lo as low next time */
+        D.settle_lo_us = D.settle_lo_us * 2 < D.settle_hi_us
+                       ? D.settle_lo_us * 2 : D.settle_hi_us;
+        D.auto_settle_us = D.settle_hi_us;
+        D.recoveries++;
+        D.fail_run = 1;
+    } else if (++D.fail_run >= SETTLE_FAIL_RUN && D.settle_hi_us < SETTLE_MAX_US) {
+        D.settle_hi_us = D.settle_hi_us * 2 < SETTLE_MAX_US
+                       ? D.settle_hi_us * 2 : SETTLE_MAX_US;
+        D.auto_settle_us = D.settle_hi_us;
+        D.fail_run = 0;
+    }
+}
+
 static void *driver_main(void *arg) {
     (void)arg;
+    pthread_setname_np(pthread_self(), "mhotap-drive");
     const char *req = ":WAVeform:DATA?\n";
     unsigned st = 0;
     while (!D.stop) {
@@ -267,9 +354,40 @@ armed:
         D.last_wait_busy_ms = t_busy ? (t_busy - t1) * 1e3 : 0.0;
         D.last_busy_ms = t_busy ? (t2 - t_busy) * 1e3 : 0.0;
 
+        /* Hold off the read after the capture reports idle.  A chunked record
+         * is still being read out of acquisition memory then, and a
+         * :WAV:DATA? that lands too early gets one 1 Mpt chunk and no more.
+         * Worse, the app stays that way: every later cycle also yields one
+         * chunk until a long enough pause clears it.  Measured at 10 M
+         * (2026-09-13, 10 s per setting, real driver, normal-run changes on):
+         *
+         *   from a working state   200 / 60 / 40 ms whole, 1.8 fps 36 MB/s
+         *                          20 ms whole; 10 ms half broken; 0 broken
+         *   from a broken state    40 / 120 / 150 ms stay broken; 200 recovers
+         *   fresh session          broken from the first cycle below 200 ms
+         *
+         * Hence hysteresis (settle_adapt): settle_hi until records arrive
+         * whole, then settle_lo; a broken record goes back to settle_hi.  A
+         * 1 Mpt record is a single call and needs none of it.
+         * mhotap_drive_settle() pins a fixed value instead. */
+        int settle = D.settle_us > 0 ? D.settle_us : D.auto_settle_us;
+        if (settle > 0) usleep((useconds_t)settle);
+        unsigned long done0 = record_begin();
         if (send_all(D.fd, req, strlen(req)) != 0) { D.trigger_errors++; break; }
-        D.last_declared = drain_reply(D.fd);
+        D.last_declared = drain_reply(D.fd, D.reply_ms);
         if (D.last_declared <= 0) D.empty_replies++;
+        /* Wait for the record itself, not just the reply: the reply can be
+         * drained before the last chunk has been copied out, and re-arming
+         * then is exactly what corrupted it.  Ends as soon as it completes. */
+        if (D.wait_record) {
+            double tw = now_s();
+            while (G.records_done == done0 && !D.stop &&
+                   (now_s() - tw) * 1e3 < D.reply_ms)
+                usleep(1000);
+            int whole = G.records_done != done0;
+            if (!whole) D.incomplete++;
+            if (D.settle_us == 0) settle_adapt(whole);
+        }
         D.cycles++;
         D.last_arm_ms = (t2 - t0) * 1e3;
         D.last_trig_ms = (now_s() - t2) * 1e3;
@@ -287,6 +405,18 @@ int mhotap_drive_start(void *set_state, void *get_status,
     memset(&D, 0, sizeof D);
     D.arm_mode = arm_mode;
     D.dwell_us = dwell_us > 0 ? dwell_us : 40000;
+    long mpt = G.rec_bytes > 0 ? G.rec_bytes / (G.bps ? G.bps : 2) / 1000000 : 1;
+    D.reply_ms = REPLY_HDR_MS + REPLY_MS_PER_MPT * (int)(mpt > 1 ? mpt - 1 : 0);
+    /* Only a chunked record needs waiting for.  A 1 Mpt record is one call,
+     * already complete by the time its reply drains -- and waiting anyway was
+     * measured to cost: 26 of 163 cycles ran the full 120 ms, 13.5 -> 11.3 fps;
+     * skipped, 14.2 fps with none incomplete (both 2026-09-13). */
+    D.wait_record = mpt > 1;
+    D.settle_hi_us = D.wait_record ? SETTLE_HI_US_PER_MPT * (int)mpt : 0;
+    D.settle_lo_us = D.wait_record ? SETTLE_LO_US_PER_MPT * (int)mpt : 0;
+    if (D.settle_hi_us > SETTLE_MAX_US) D.settle_hi_us = SETTLE_MAX_US;
+    if (D.settle_lo_us > D.settle_hi_us) D.settle_lo_us = D.settle_hi_us;
+    D.auto_settle_us = D.settle_hi_us;   /* a fresh session starts broken */
 
     D.set_state  = (setstate_fn)set_state;
     D.get_status = (getstatus_fn)get_status;
@@ -321,7 +451,11 @@ void mhotap_drive_stop(void) {
     D.running = 0;
 }
 
-void mhotap_drive_stats(double *out /* 10 doubles */) {
+/* Pin the read delay in us, overriding the adaptive one; 0 goes back to
+ * adaptive.  Call after mhotap_drive_start, which clears it. */
+void mhotap_drive_settle(int us) { D.settle_us = us > 0 ? us : 0; }
+
+void mhotap_drive_stats(double *out /* 13 doubles */) {
     if (!out) return;
     out[0] = (double)D.cycles;
     out[1] = (double)D.arm_timeouts;
@@ -333,6 +467,9 @@ void mhotap_drive_stats(double *out /* 10 doubles */) {
     out[7] = D.last_wait_busy_ms;
     out[8] = D.last_busy_ms;
     out[9] = (double)D.missed_busy;
+    out[10] = (double)D.incomplete;
+    out[11] = (D.settle_us > 0 ? D.settle_us : D.auto_settle_us) / 1000.0;
+    out[12] = (double)D.recoveries;
 }
 
 /* ---------------------------------------------------------------- public */
@@ -390,35 +527,75 @@ int mhotap_frame(const void *src, long nbytes) {
      * can free the slots in between, and a hook already past the check then
      * writes into freed memory.  (That crashed the app with SIGSEGV at 0x0 in
      * gum-js-loop.)  The sender does not hold the lock while sending, so the
-     * ~1.5 ms memcpy costs it nothing. */
+     * copy costs it nothing: a 1 Mpt frame memcpys in 0.31 ms on this box
+     * (measured on the scope 2026-09-09, -O3). */
     pthread_mutex_lock(&G.m);
     if (!G.running || nbytes > G.slot_cap) {
         pthread_mutex_unlock(&G.m);
         return -1;
     }
-    G.frames_in++;
-    if (G.count == NSLOTS) {
-        /* Sender has not kept up.  Drop rather than stall the scope's own
-         * readout thread, which is what we are running on. */
-        G.frames_dropped++;
-        pthread_mutex_unlock(&G.m);
-        return 1;
+    G.chunks_in++;
+    long want = G.rec_bytes > 0 ? G.rec_bytes : nbytes;
+    if (G.fill_len + nbytes > want) {
+        /* Overruns the record, so the rest of the previous one never came.
+         * Drop it -- a splice of two acquisitions is worse than a gap -- and
+         * take this chunk as the start of a new record. */
+        if (G.fill_len) G.partial_records++;
+        G.fill_len = 0;
+        if (nbytes > want) { pthread_mutex_unlock(&G.m); return -1; }
     }
-    slot_t *sl = &G.slots[G.head];
-    memcpy(sl->buf, src, (size_t)nbytes);
-    sl->len = nbytes;
-    sl->seq = G.seq++;
-    G.head = (G.head + 1) % NSLOTS;
-    G.count++;
-    pthread_cond_signal(&G.can_send);
+    if (G.fill_len == 0) {
+        G.frames_in++;
+        /* Sender has not kept up.  Skip the whole record rather than stall
+         * the scope's own readout thread, which is what we are running on;
+         * its chunks are still counted, so the record boundary stays known. */
+        G.fill_skip = (G.count == NSLOTS);
+        if (G.fill_skip) G.frames_dropped++;
+    }
+    /* slots[head] stays free for the whole assembly: the sender only consumes
+     * from tail, and nothing but this function advances head. */
+    if (!G.fill_skip)
+        memcpy(G.slots[G.head].buf + G.fill_len, src, (size_t)nbytes);
+    G.fill_len += nbytes;
+    if (G.fill_len < want) {
+        pthread_mutex_unlock(&G.m);
+        return 0;
+    }
+    int rc = 1;
+    if (!G.fill_skip) {
+        slot_t *sl = &G.slots[G.head];
+        sl->len = G.fill_len;
+        sl->seq = G.seq++;
+        G.head = (G.head + 1) % NSLOTS;
+        G.count++;
+        pthread_cond_signal(&G.can_send);
+        rc = 0;
+    }
+    G.fill_len = 0;
+    G.records_done++;
     pthread_mutex_unlock(&G.m);
-    return 0;
+    return rc;
+}
+
+/* Bytes in one whole record (points x bytes per sample).  Set once, after init
+ * and before the hooks are enabled; 0 ships every call as its own frame. */
+void mhotap_set_record(long nbytes) {
+    pthread_mutex_lock(&G.m);
+    G.rec_bytes = (nbytes > 0 && nbytes <= G.slot_cap) ? nbytes : 0;
+    G.fill_len = 0;
+    pthread_mutex_unlock(&G.m);
 }
 
 void mhotap_set_rate(double srate) { G.srate = srate; }
 
+void mhotap_set_yscale(double yinc, double yorig, double yref) {
+    G.yinc = yinc; G.yorig = yorig; G.yref = yref;
+}
+
+
+
 /* Fills caller-provided storage so the injector needs no struct layout. */
-void mhotap_stats(double *out /* 8 doubles */) {
+void mhotap_stats(double *out /* 10 doubles */) {
     if (!out) return;
     double el = now_s() - G.t0;
     out[0] = (double)G.frames_in;
@@ -429,6 +606,8 @@ void mhotap_stats(double *out /* 8 doubles */) {
     out[5] = el > 0 ? G.frames_sent / el : 0.0;
     out[6] = el > 0 ? G.bytes_sent / el / 1e6 : 0.0;
     out[7] = (double)G.send_errors;
+    out[8] = (double)G.chunks_in;
+    out[9] = (double)G.partial_records;
 }
 
 void mhotap_close(void) {
@@ -446,6 +625,7 @@ void mhotap_close(void) {
     G.fd = -1;
     /* Deliberately NOT freeing the slot buffers: the hook stays installed for
      * the life of the process, so keeping the allocations alive removes any
-     * remaining chance of a use-after-free.  3 x 2 MB is a cheap insurance
-     * premium against crashing the scope. */
+     * remaining chance of a use-after-free.  NSLOTS records' worth (6 MB at
+     * 1 Mpt, 60 MB at 10 M) is the insurance premium against crashing the
+     * scope. */
 }

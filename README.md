@@ -5,7 +5,7 @@ A spectrum analyser for the PC, fed by a Rigol MHO934 oscilloscope.
 The scope captures; this does the maths and owns the display. Records arrive
 either over SCPI or — much faster — through an in-app *tap* injected into the
 scope's own process, which hands over the sample buffer the app already holds
-and skips the SCPI reply path entirely. On a 1 Mpt record that is ~14 fps.
+and skips the SCPI reply path entirely. On a 1 Mpt record that is ~15 fps.
 
 This started life as `fftdemo/` in the
 [mho-speed-patch](../rigol) repo and outgrew it. That repo still owns the speed
@@ -18,7 +18,8 @@ patch itself and the reverse-engineering behind it; see
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ./run_fft.sh                       # synthetic signal, no scope needed
-./run_fft.sh tap 172.30.188.217    # live off the scope, fastest path
+./run_fft.sh tap                   # live off the scope, asks for the IP
+./run_fft.sh tap 192.168.23.20     # ... or give it, and it is remembered
 ./run_fft.sh scpi 192.168.23.20    # live over plain SCPI, slower
 ./run_fft.sh stream                # listen for a tap started elsewhere
 ./run_fft.sh --help
@@ -32,8 +33,14 @@ captures a frame and exits, which is how the smoke tests work.
 | Path | What it is |
 |---|---|
 | `run_fft.sh` | launcher — picks a source, runs the app out of `.venv` |
-| `spectrum/fft_gui.py` | the application: pyqtgraph display, controls, CLI |
-| `spectrum/spectrum.py` | `SpectrumEngine` — windowing, FFT, averaging, dB, display reduction |
+| `spectrum/fft_gui.py` | entry point: CLI, source construction, headless harness |
+| `spectrum/window.py` | the main window — wiring and the frame loop |
+| `spectrum/viewmodel.py` | `FreqView` / `AmpScale` — the axis arithmetic, Qt-free |
+| `spectrum/panels.py` | control groups: FREQ / AMPT / BW-DET / MARKER / VIEW |
+| `spectrum/plots.py` | the spectrum pane and the frame-timing strip |
+| `spectrum/markers.py` | markers, deltas, and the marker table |
+| `spectrum/analysis.py` | peak search, ADC spur frequencies, CSV export |
+| `spectrum/spectrum.py` | `SpectrumEngine` — windowing, FFT, averaging, dB, detectors |
 | `spectrum/sources.py` | interchangeable frame sources: `synthetic`, `scpi`, `stream`/`tap` |
 | `spectrum/stream_client.py` | wire protocol + listener for the on-scope tap |
 | `spectrum/frametime.py` | per-frame timing: where a slow frame went |
@@ -44,28 +51,35 @@ captures a frame and exits, which is how the smoke tests work.
 | `device/build_tap.sh` | cross-compiles `libmhotap.so` (needs `$ANDROID_NDK`) |
 | `device/rigol_mho.py` | SCPI client (stdlib only) |
 | `device/adb.py` | adb/frida plumbing: connect, root, frida-server, find the app pid |
+| `tests/acq_sweep.py` | sweeps timebase × memory depth: tap capture checks + GUI smoke test at each point |
 | `docs/SPECTRUM_ANALYSER_FEATURES.md` | **the roadmap** — 199 features scored against what exists |
 
 ## Where the project is going
 
 `docs/SPECTRUM_ANALYSER_FEATURES.md` surveys what real spectrum analysers do
 (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, and the SDR tools) and
-scores all 199 features against this codebase: **21 Done, 17 Partial, 146
+scores all 199 features against this codebase: **55 Done, 14 Partial, 115
 Missing, 15 N/A on this hardware.** It ends with a five-phase build order.
 
-**Phase 1 — make the existing display honest and measurable.** The current
-display is a good FFT viewer and not yet an analyser: it has no reference
-level, no markers, no true RBW, and its amplitude axis is dBFS rather than
-anything absolute. Phase 1 fixes that, and every item in it is PC-side work
-that the synthetic source exercises — no scope required.
+**Phase 1 — make the existing display honest and measurable — is done.** It
+turned an FFT viewer into something whose numbers can be quoted: ENBW-correct
+RBW alongside the bin spacing, seven bin-to-pixel detectors, reference level
+and dB/div with auto-scale, centre/span and start/stop entry, markers with
+deltas and peak stepping, a peak table, full-resolution CSV export, clipping
+and blind-time annunciation, and ADC-spur marks at k·fs/16. All of it is
+exercised by the synthetic source — no scope required.
 
-Two findings from the survey worth knowing before you touch the code:
+**Phase 2 — traces, measurements and absolute units** is next: independent
+traces with the Active/View/Blank model, the measurement suite (channel power,
+OBW, THD, SFDR, SINAD/ENOB), and the scope preamble plumbed through the tap.
 
-* **`Spectrum.resolution` is bin spacing, not RBW.** It is `sample_rate / n`
-  (`spectrum/spectrum.py`), and the status bar honestly says `Hz/bin` — but
-  there is no ENBW anywhere in the codebase, and a hann window's true
-  resolution bandwidth is ~1.5× the bin spacing. Anything claiming dBm/Hz, a
-  noise marker, or channel power needs the ENBW correction first.
+Two findings worth knowing before you touch the code:
+
+* **`Spectrum.resolution` is bin spacing, not RBW.** It is `sample_rate / n`;
+  the real bandwidth is `Spectrum.rbw`, which is `enbw_bins × resolution`
+  (hann 1.50, Blackman-Harris 2.00, flat-top 3.77, computed from the window
+  itself rather than tabulated). Both are on screen, labelled differently.
+  Anything claiming dBm/Hz, a noise marker or channel power must use the RBW.
 * **Absolute amplitude units are blocked at the transport, not the display.**
   `device/libmhotap.c` zeroes its record header and writes only magic, sequence,
   sample count, bytes-per-sample and sample rate — no `yincrement`/`yorigin`/
@@ -78,10 +92,11 @@ Being accurate about this saves chasing features that cannot exist here:
 
 * **No tuner or mixer.** The analyser sees DC to Nyquist and nothing above it.
   There is no RF centre-frequency tuning in the swept-analyser sense.
-* **Not a real-time analyser.** A ~500 µs record every ~75–90 ms is under 1%
-  duty cycle. Persistence and spectrogram displays are worth building, but
-  100% probability-of-intercept and frequency-mask triggering are not
-  achievable — do not let the UI imply otherwise.
+* **Not a real-time analyser.** A 1 Mpt record at 50 MSa/s is 20 ms of signal
+  and arrives every ~65 ms, so roughly a third of wall-clock time is observed
+  and two thirds is missed. Persistence and spectrogram displays are worth
+  building, but 100% probability-of-intercept and frequency-mask triggering
+  are not achievable — do not let the UI imply otherwise.
 * **Dynamic range is set by the scope's front end.** SFDR is ~60 dB, limited
   by ADC interleave spurs at multiples of fs/16 (they are a hardware artifact,
   not harmonics of the signal — annotating them is a Phase 1 item).

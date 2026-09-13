@@ -2,8 +2,10 @@
 /*
  * mho_tap.js -- inject libmhotap.so and feed it the raw record.
  *
- * CApiWave::toWord/toByte(uchar *src, int n) receive a pointer to the COMPLETE
- * record before any SCPI framing.  We hand that pointer to the native tap
+ * CApiWave::toWord/toByte(uchar *src, int n) receive a pointer to the record
+ * before any SCPI framing -- the whole record up to 1 Mpt, and consecutive
+ * 1 Mpt chunks above that, which libmhotap reassembles (start() passes the
+ * record size for exactly this).  We hand that pointer to the native tap
  * (which copies it and ships it from its own thread) and then zero the point
  * count, so the app's marshalling and SCPI framing do no work at all and the
  * reply is an empty block.
@@ -65,14 +67,20 @@ function loadTap(soPath) {
                                   'void', ['pointer']);
     fn.close = new NativeFunction(resolve(m, 'mhotap_close'),
                                   'void', []);
+    fn.yscale = new NativeFunction(resolve(m, 'mhotap_set_yscale'),
+                                  'void', ['double', 'double', 'double']);
     fn.rate  = new NativeFunction(resolve(m, 'mhotap_set_rate'),
                                   'void', ['double']);
+    fn.record = new NativeFunction(resolve(m, 'mhotap_set_record'),
+                                   'void', ['long']);
     fn.driveStart = new NativeFunction(resolve(m, 'mhotap_drive_start'),
                                        'int', ['pointer', 'pointer', 'int', 'int']);
     fn.driveStop  = new NativeFunction(resolve(m, 'mhotap_drive_stop'),
                                        'void', []);
     fn.driveStats = new NativeFunction(resolve(m, 'mhotap_drive_stats'),
                                        'void', ['pointer']);
+    fn.driveSettle = new NativeFunction(resolve(m, 'mhotap_drive_settle'),
+                                        'void', ['int']);
     tap = m;
     return m.base.toString();
 }
@@ -83,6 +91,7 @@ var plotSelf = null;                 /* CApiPlotWave*, captured from doRender */
 var plotListener = null;
 var plotFns = null;
 var scpiListener = null;             /* usleep hook, while suppressing */
+var patched_sites = [];              /* movz immediates we rewrote */
 var scpiSkipped = 0;
 var scpiUs = 1000;                   /* what the 20 ms sleep becomes */
 var hooked = false;
@@ -140,26 +149,34 @@ function installHooks() {
 
 rpc.exports = {
     load: function (soPath) { return loadTap(soPath); },
-    start: function (host, port, maxBytes, srate, bps) {
+    start: function (host, port, maxBytes, srate, bps, recordBytes) {
         var rc = fn.init(Memory.allocUtf8String(host), port, maxBytes, srate, bps);
         if (rc !== 0) return { ok: false, rc: rc };
+        /* Before the hooks go live, so the first chunk is already assembled. */
+        if (recordBytes) fn.record(recordBytes);
         var n = installHooks();
         enabled = true;
         return { ok: true, hooks: n };
     },
     setRate: function (srate) { fn.rate(srate); return true; },
+    /* volts = (code - yref) * yinc + yorig.  Without it the receiver has no
+     * way to label the axis in anything but dBFS. */
+    setYScale: function (yinc, yorig, yref) {
+        fn.yscale(yinc, yorig, yref); return true;
+    },
     /* Leave the hooks installed but inert -- detaching them is riskier than
      * letting them fall through. */
     pause: function () { enabled = false; return true; },
     resume: function () { enabled = true; return true; },
     stats: function () {
-        if (!statsBuf) statsBuf = Memory.alloc(8 * 8);
+        if (!statsBuf) statsBuf = Memory.alloc(10 * 8);
         fn.stats(statsBuf);
         var o = [];
-        for (var i = 0; i < 8; i++) o.push(statsBuf.add(i * 8).readDouble());
+        for (var i = 0; i < 10; i++) o.push(statsBuf.add(i * 8).readDouble());
         return { frames_in: o[0], frames_sent: o[1], dropped: o[2],
                  bytes: o[3], elapsed: o[4], fps: o[5], mbps: o[6],
-                 send_errors: o[7], hook_calls: seen };
+                 send_errors: o[7], chunks_in: o[8], partial: o[9],
+                 hook_calls: seen };
     },
     /* Run the whole frame loop on the scope: arm, trigger over loopback,
      * drain.  Nothing crosses the RPC boundary per frame. */
@@ -241,6 +258,78 @@ rpc.exports = {
      * from one spinning thread, so the filter checks the duration first (an
      * integer compare) and only then the return address.  If the offsets ever
      * stop matching, nothing is skipped and the tap simply runs as before. */
+    /* --- patch hardcoded usleep constants -------------------------------
+     * Three sleeps fire exactly once per acquisition and account for ~40 ms of
+     * a 76 ms cycle against 21 ms of real capture (measured 2026-09-09 by
+     * histogramming usleep return addresses while streaming).  Each one takes
+     * its argument from a plain `mov w<rd>, #imm` a couple of instructions
+     * earlier, so the constant can be rewritten in place:
+     *
+     *   +0x3417fc  mov w8,#0x4e20 (20000)  CCalibration_ADC::DrvCalibration_SetAdcStary
+     *   +0x30ef60  mov w0,#0x2710 (10000)  CDrvScope::ReadNormTrace
+     *   +0x2e945c  mov w9,#0x3e8  (1000)   CDrvScope::run -- a MULTIPLIER,
+     *                                      usleep(n * w9), so scale it instead
+     *   +0x68506c  mov w0,#0x4e20 (20000)  CScpiParserWorker::addRemoteEvent
+     *                                      (already handled by scpiSleep)
+     *
+     * Patched, not hooked.  An Interceptor on usleep costs a trampoline on
+     * ~65,000 calls a second to catch the 13 that matter: measured -1.89 fps
+     * (13.28 -> 11.39) with a deliberately bogus offset that never matched,
+     * more than the sleeps were worth.  A movz rewrite costs nothing at
+     * runtime.  It is also much safer than rewriting the `bl usleep` itself
+     * (which killed the app when tried): same instruction, same register,
+     * only the immediate changes, and Memory.patchCode handles the I-cache.
+     *
+     * Offsets are for the build in /data/app/com.rigol.scope-2/base.apk --
+     * NOT the copy in the firmware image, which is a different build with
+     * different addresses.  Every patch verifies the instruction really is a
+     * movz with the expected immediate before touching it, so a stale offset
+     * is refused rather than corrupting code.
+     */
+    patchSleepConsts: function (specs) {
+        var done = [];
+        try {
+            specs.forEach(function (sp) {
+                var off = sp[0], want = sp[1], to = sp[2];
+                var addr = mod.base.add(off);
+                var orig = addr.readU32();
+                /* movz and movk share a layout: sf/opc, hw at 21-22, imm16
+                 * at 5-20, Rd at 0-4.  Accept both, because a constant over
+                 * 16 bits is built as movz+movk and the interesting half may
+                 * be in either (CCalibration's 100000 is movz #0x86a0 then
+                 * movk #1,lsl#16).  Preserve everything but the immediate. */
+                var opc = orig & 0x7F800000;
+                var isMovz = opc === 0x52800000;
+                var isMovk = opc === 0x72800000;
+                var imm = (orig >>> 5) & 0xFFFF;
+                var rd = orig & 0x1F;
+                if ((!isMovz && !isMovk) || imm !== want) {
+                    done.push({ off: off, ok: false,
+                                why: 'expected movz/movk #' + want +
+                                     ', found 0x' + (orig >>> 0).toString(16) });
+                    return;
+                }
+                var keep = orig & ~(0xFFFF << 5);       /* opcode, hw, Rd */
+                var patched = ((keep | ((to & 0xFFFF) << 5)) >>> 0);
+                Memory.patchCode(addr, 4, function (pw) { pw.writeU32(patched); });
+                patched_sites.push({ addr: addr, orig: orig, off: off });
+                done.push({ off: off, ok: true, from: imm, to: to, rd: rd });
+            });
+            return { ok: true, sites: done };
+        } catch (e) { return { ok: false, error: String(e), sites: done }; }
+    },
+    restoreSleepConsts: function () {
+        var n = 0;
+        patched_sites.forEach(function (p) {
+            try {
+                Memory.patchCode(p.addr, 4, function (pw) { pw.writeU32(p.orig); });
+                n++;
+            } catch (e) {}
+        });
+        patched_sites = [];
+        return { ok: true, restored: n };
+    },
+
     scpiSleep: function (on, us) {
         try {
             if (on) {
@@ -284,8 +373,9 @@ rpc.exports = {
     },
     scpiSkipped: function () { return scpiSkipped; },
     driveStop:  function () { fn.driveStop(); return true; },
+    driveSettle: function (us) { fn.driveSettle(us | 0); return true; },
     driveStats: function () {
-        if (!driveBuf) driveBuf = Memory.alloc(10 * 8);
+        if (!driveBuf) driveBuf = Memory.alloc(13 * 8);
         fn.driveStats(driveBuf);
         return { cycles: driveBuf.readDouble(),
                  arm_timeouts: driveBuf.add(8).readDouble(),
@@ -296,7 +386,10 @@ rpc.exports = {
                  declared: driveBuf.add(48).readDouble(),
                  wait_busy_ms: driveBuf.add(56).readDouble(),
                  busy_ms: driveBuf.add(64).readDouble(),
-                 missed_busy: driveBuf.add(72).readDouble() };
+                 missed_busy: driveBuf.add(72).readDouble(),
+                 incomplete: driveBuf.add(80).readDouble(),
+                 settle_ms: driveBuf.add(88).readDouble(),
+                 recoveries: driveBuf.add(96).readDouble() };
     },
     stop: function () { enabled = false; fn.driveStop(); fn.close(); return true; }
 };

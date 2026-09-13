@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import collections
 import struct
 import zlib
 import threading
@@ -36,6 +37,11 @@ class Frame:
     samples: np.ndarray          # raw codes, uint16 (WORD) or uint8 (BYTE)
     sample_rate: float
     recv_time: float
+    # volts = (code - yref) * yinc + yorig.  yinc == 0 means the source could
+    # not tell us the vertical scale, and the display stays in dBFS.
+    yinc: float = 0.0
+    yorig: float = 0.0
+    yref: float = 0.0
 
     @property
     def npoints(self) -> int:
@@ -44,6 +50,7 @@ class Frame:
     @property
     def duration(self) -> float:
         return self.npoints / self.sample_rate if self.sample_rate else 0.0
+
 
 
 class StreamServer:
@@ -62,6 +69,9 @@ class StreamServer:
         self.frames = 0
         self.dropped = 0
         self.bytes = 0
+        # (arrival time, bytes) for the trailing-window rate; a few hundred
+        # entries covers RATE_WINDOW_S at any rate this link can reach.
+        self._rate_hist: collections.deque = collections.deque(maxlen=4096)
         # A frame byte-identical to the previous one means the scope had not
         # finished a new acquisition and the record was re-read.  Counted on
         # every arriving frame, not just delivered ones.
@@ -96,13 +106,46 @@ class StreamServer:
             self._new.clear()
             return self._latest
 
+    # Rate over the last RATE_WINDOW_S seconds, not since the start.  A run
+    # takes several seconds to reach steady state (the first frame alone can be
+    # 2 s), and a cumulative mean buries that ramp in every number: a 45 s run
+    # measured 12.70 fps cumulative while the last seconds were running well
+    # above that.  Comparing two configurations then compares their startups as
+    # much as their throughput.  `fps_avg`/`mbps_avg` keep the old cumulative
+    # figures for anything that wants a whole-run total.
+    RATE_WINDOW_S = 5.0
+
+    def _rate(self):
+        """(fps, MB/s) over the trailing window, or None while it is not full."""
+        with self._lock:
+            hist = list(self._rate_hist)
+        if len(hist) < 2:
+            return None
+        now = time.perf_counter()
+        cut = now - self.RATE_WINDOW_S
+        win = [h for h in hist if h[0] >= cut]
+        if len(win) < 2:
+            return None
+        span = win[-1][0] - win[0][0]
+        if span <= 0:
+            return None
+        # n-1 intervals between n timestamps
+        nf = len(win) - 1
+        nb = sum(h[1] for h in win[1:])
+        return nf / span, nb / span / 1e6
+
     def stats(self) -> dict:
         el = (time.perf_counter() - self.t0) if self.t0 else 0.0
+        cum_fps = self.frames / el if el > 0 else 0.0
+        cum_mbps = self.bytes / el / 1e6 if el > 0 else 0.0
+        r = self._rate()
         return {
             "frames": self.frames, "dropped": self.dropped,
             "elapsed": el,
-            "fps": self.frames / el if el > 0 else 0.0,
-            "mbps": self.bytes / el / 1e6 if el > 0 else 0.0,
+            "fps": r[0] if r else cum_fps,
+            "mbps": r[1] if r else cum_mbps,
+            "fps_avg": cum_fps, "mbps_avg": cum_mbps,
+            "window_s": self.RATE_WINDOW_S if r else el,
             "connected": self.connected,
             "error": self.error,
             "repeats": self.repeats,
@@ -167,7 +210,8 @@ class StreamServer:
             if bps not in (1, 2) or not (0 < npts <= 1 << 28):
                 raise ValueError(f"implausible frame header: {npts} pts x {bps} B")
 
-            payload = self._recv_exact(conn, npts * bps, self._stop)
+            nbytes = npts * bps
+            payload = self._recv_exact(conn, nbytes, self._stop)
             if payload is None:
                 return
             t_read = time.perf_counter()
@@ -181,14 +225,16 @@ class StreamServer:
 
             now = time.perf_counter()
             frame = Frame(seq=seq, samples=samples, sample_rate=srate,
-                          recv_time=now)
+                          recv_time=now, yinc=_yi, yorig=_yo, yref=_yr)
             with self._lock:
                 if self._new.is_set():
                     self.dropped += 1      # consumer never picked up the last one
                 self._latest = frame
                 self._new.set()
             self.frames += 1
-            self.bytes += HDR + npts * bps
+            self.bytes += HDR + nbytes
+            with self._lock:
+                self._rate_hist.append((now, HDR + nbytes))
             self.timing.record(
                 t=now,
                 arr_gap_ms=((now - self._last_arrival) * 1e3

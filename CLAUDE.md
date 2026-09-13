@@ -22,39 +22,74 @@ verified with no scope attached — use it.
 `docs/SPECTRUM_ANALYSER_FEATURES.md` is the plan: 199 features from real
 analysers (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, SDR tools),
 each scored Status / Effort / Value against this code, then a five-phase order.
-Currently 21 Done, 17 Partial, 146 Missing, 15 N/A on this hardware.
+Currently 55 Done, 14 Partial, 115 Missing, 15 N/A on this hardware.
 
-**Phase 1 is the current work**: ENBW-corrected RBW readout; a detector
-selector on `reduce_for_display()`; reference level and dB/div replacing the
-hardcoded −160…+5; centre/span and start/stop entry; markers with delta and
-next-peak; peak table with CSV export; clipping annunciation; ADC-spur
-annotation at k·fs/16; and a blind-time readout that states plainly this is
-not an RTSA. All PC-side, all synthetic-testable.
+**Phase 1 is done.** Phase 2 (multiple traces, absolute units via the tap
+preamble, the measurement suite) is next; the trace-mode restructure below is
+its first real obstacle.
 
 ## Traps
 
 * **`Spectrum.resolution` is bin spacing, not RBW.** It is `sample_rate / n`.
-  The status bar correctly says `Hz/bin`, but there is no ENBW in the codebase
-  and hann's true RBW is ~1.5× the bin spacing. Fix this before building
-  anything that quotes dBm/Hz, noise markers, or channel power — Keysight and
-  Siglent both document conflating the two as a classic error.
+  Use `Spectrum.rbw` for a bandwidth: it is `enbw_bins × resolution`, and
+  `window_enbw()` computes ENBW from the actual window array rather than a
+  table, so changing the coefficients cannot leave a stale constant behind
+  (measured: rect 1.00, hann 1.50, Blackman-Harris 2.00, flat-top 3.77). Both
+  are shown in the annotation block, labelled differently on purpose —
+  Keysight and Siglent both document conflating them as a classic error.
 * **Absolute units are blocked in the tap, not the GUI.** `device/libmhotap.c`
   memsets its header and writes only magic, seq, sample count, bytes-per-sample
   and sample rate. No `yincrement`/`yorigin`/`yreference`, so the stream carries
   no vertical scale and the display can only be dBFS. `device/rigol_mho.py`
   (SCPI) does have them. dBm/dBV over the tap needs a header change plus a
   rebuilt `.so` pushed to the scope — treat it as a device-layer task.
+* **Above 1 Mpt the record arrives in 1 Mpt chunks, and the read has to wait.**
+  `CApiWave::toWord` is called once per chunk (10 calls at 10 M), and a
+  `:WAV:DATA?` sent the instant the capture goes idle gets one chunk — then
+  every later cycle gets one chunk too, until a ~200 ms pause clears it.
+  `libmhotap.c` reassembles by record size and adapts the read delay (200 ms
+  to recover, 40 ms once whole; measured at 10 M only, scaled per Mpt
+  elsewhere). Before that, 10 M shipped 1 Mpt fragments labelled 500 MSa/s: a
+  1 MHz tone read as 10 MHz, at "6 fps, 12 MB/s". Check any depth work with
+  `tests/acq_sweep.py --tone`; details in `docs/SCOPE_INTERNALS.md`.
 * **Peak hold is applied after averaging**, in the same chain — it is
   max-hold-of-the-average, not an independent trace. Real trace modes
   (clear-write / max / min / average / view / blank as separate traces) are a
   restructure of `SpectrumEngine`, not a checkbox.
 * **Averaging is exponential-only and never completes** — there is no
   average-count that terminates, which is what bench analysers do.
-* **Don't claim RTSA behaviour in the UI.** ~500 µs of signal every ~75–90 ms
-  is under 1% duty cycle. Persistence and spectrogram are fine and worth
-  building; 100% POI and frequency-mask trigger are not achievable here.
+* **Don't claim RTSA behaviour in the UI.** A 1 Mpt record at 50 MSa/s is
+  20 ms of signal, and the frame period is ~65 ms, so ~31% is observed and
+  ~69% is blind (measured 2026-09-13; an earlier note here said "under 1%",
+  which was for a much shorter record and is long stale). Better, but still
+  not real-time: persistence and spectrogram are fine and worth building;
+  100% POI and frequency-mask trigger are not achievable here.
 * **Spurs at multiples of fs/16 are an ADC interleave artifact**, not signal
   harmonics. They set the ~60 dB SFDR floor. Annotate, never "fix".
+
+## GUI layout
+
+`spectrum/fft_gui.py` is argparse plus the headless harness; the window lives in
+`window.py`, and under it: `viewmodel.py` (FreqView/AmpScale — the axis
+arithmetic, deliberately Qt-free and the place to test it), `panels.py` (the
+FREQ/AMPT/BW/MARKER/VIEW control groups, each emitting signals and holding no
+reference to the engine), `plots.py` (spectrum pane and timing strip),
+`markers.py`, `analysis.py` (peak search, spur frequencies, CSV).
+
+`window.py` owns the frame loop and the per-frame instrumentation, which is
+what catches a new feature's cost — that is how the peak search's 12–17 ms was
+found. If you add per-frame work, look at `draw_ms` / `work_ms` in the exit
+report before and after.
+
+Two performance traps live in that loop:
+
+* **A peak threshold below the noise floor costs more than the FFT.** scipy
+  filters by height before computing prominences, so a threshold in the noise
+  makes every noise bin a candidate: 12–17 ms/frame versus 2.5 ms above it,
+  against an ~8 ms FFT. `analysis.auto_threshold()` is the default and tracks
+  the floor.
+* **Peaks are only computed while the peaks tab is showing**, and at most every
+  300 ms.
 
 ## Device layer
 

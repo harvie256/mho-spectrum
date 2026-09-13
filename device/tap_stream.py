@@ -104,7 +104,18 @@ def setup_readout(sc: Scope, channel: int, fmt: str):
     if npts <= 0:
         raise SystemExit("scope reports an empty record after priming")
     srate = float(sc.query(":ACQuire:SRATe?"))
-    return npts, srate
+    # The vertical scale, so the receiver can offer dBV/dBm instead of only
+    # dBFS.  Queried once here rather than per frame: it only changes when the
+    # V/div does, and the tap deliberately never talks SCPI in the frame loop.
+    # Any failure leaves it at zero, which the receiver reads as "unknown".
+    yinc = yorig = yref = 0.0
+    try:
+        yinc = float(sc.query(":WAVeform:YINCrement?"))
+        yorig = float(sc.query(":WAVeform:YORigin?"))
+        yref = float(sc.query(":WAVeform:YREFerence?"))
+    except Exception as e:
+        adbutil.log(f"no vertical scale ({e}); the display stays in dBFS")
+    return npts, srate, (yinc, yorig, yref)
 
 
 def main():
@@ -139,6 +150,32 @@ def main():
                          "command (see --scpi-sleep-us).  The tap pays it once "
                          "per frame on the :WAVeform:DATA? that triggers "
                          "production -- ~23%% of the cycle.  Restored on exit")
+    ap.add_argument("--sleep-const", action="append", default=[],
+                    metavar="OFF:EXPECT_US:NEW_US",
+                    help="rewrite a hardcoded usleep constant in place, e.g. "
+                         "0x3417fc:20000:10000.  Three sleeps fire once per "
+                         "acquisition and cost ~40 ms of a 76 ms cycle: "
+                         "0x3417fc (20 ms, ADC calibration), 0x30ef60 (10 ms, "
+                         "CDrvScope::ReadNormTrace) and 0x2e945c (a 1000 "
+                         "MULTIPLIER in CDrvScope::run -- usleep(n*w9), so "
+                         "scale it rather than set it).  Offsets are for the "
+                         "build in /data/app, not the firmware image.  The "
+                         "patch is refused unless the instruction really is a "
+                         "movz with EXPECT_US, and is restored on exit.  "
+                         "Watch the repeat count: every frame is CRCed, so a "
+                         "stale record shows up there.  Measured: the ADC "
+                         "sleep tolerates 20 -> 10 ms but degrades below that "
+                         "and returns stale records at 1 ms")
+    ap.add_argument("--quiet-logd", action="store_true",
+                    help="stop logd for the session and start it again on "
+                         "exit.  The app logs hard enough that the log "
+                         "pipeline costs 0.62 of a core while streaming "
+                         "(measured 2026-09-09: logd 52%%, logcatext 5%%, two "
+                         "file drains 4%%); stopping it took the box from "
+                         "88.8%% to 81.7%% busy and 12.5 -> 13.4 fps.  Nothing "
+                         "is logged while it is off, and if this process is "
+                         "killed hard logd stays stopped until 'adb shell "
+                         "start logd' or a reboot")
     ap.add_argument("--drive-csv", default="",
                     help="with --drive-poll-ms, append one row per observed "
                          "cycle: t, cycle, arm, wait-for-busy, busy, trigger, "
@@ -197,18 +234,24 @@ def main():
     adbutil.log(f"libmhotap.so loaded at {base}")
 
     sc = Scope(host=scpi_ip, timeout=30.0)
-    npts, srate = setup_readout(sc, args.channel, args.format)
+    npts, srate, yscale = setup_readout(sc, args.channel, args.format)
     bps = 2 if args.format == "WORD" else 1
     adbutil.log(f"CH{args.channel} {args.format}: {npts} pts ({npts*bps} B/frame) "
            f"@ {srate/1e6:.0f} MSa/s")
 
+    # The last argument is the whole record: above 1 Mpt the app produces it
+    # in 1 Mpt chunks, and the tap only publishes once all of them are in.
     r = tap.exports_sync.start(args.pc_host, args.pc_port, npts * bps + 4096,
-                               srate, bps)
+                               srate, bps, npts * bps)
     if not r.get("ok"):
         session.detach()
         raise SystemExit(f"tap start failed rc={r.get('rc')} -- is the PC "
                          f"receiver listening on {args.pc_host}:{args.pc_port}?")
     adbutil.log(f"tap streaming to {args.pc_host}:{args.pc_port} ({r['hooks']} hooks)")
+    if yscale[0]:
+        tap.exports_sync.set_y_scale(*yscale)
+        adbutil.log(f"vertical scale: {yscale[0]:.6g} V/code, origin {yscale[1]:g}, "
+                    f"ref {yscale[2]:g}")
 
     # Hand the whole frame loop to the scope: arming, triggering and draining
     # all happen there, so no per-frame RPC round trip to the host.
@@ -248,6 +291,56 @@ def main():
         else:
             adbutil.log("could not reach CApiPlotWave::doRender; leaving the "
                    "scope's redraw alone")
+
+    # Third temporary change, same contract as the two above: the scope's own
+    # logging is the single largest non-app consumer while we stream.  It is
+    # the *ingestion* that costs, not the readers -- killing the file drains
+    # alone only recovered 0.10 of a core, stopping logd recovered all 0.62.
+    sleep_consts = []
+    for spec in args.sleep_const:
+        try:
+            off, want, to = spec.split(":")
+            sleep_consts.append([int(off, 0), int(want, 0), int(to, 0)])
+        except ValueError:
+            raise SystemExit(f"bad --sleep-const {spec!r}, "
+                             f"want OFF:EXPECT_US:NEW_US")
+    patched = False
+    if sleep_consts:
+        r = tap.exports_sync.patch_sleep_consts(sleep_consts)
+        for site in r.get("sites", []):
+            if site.get("ok"):
+                patched = True
+                adbutil.log(f"patched +0x{site['off']:x}: "
+                            f"{site['from']} -> {site['to']} us")
+            else:
+                # Loud, and on stderr: a moved offset means the run silently
+                # loses ~1.6 fps, and the only other trace of it is a line in
+                # a temp log nobody reads.  A firmware update is the usual
+                # cause -- the constant has to be re-derived.
+                msg = (f"WARNING: could not patch +0x{site['off']:x} "
+                       f"({site['why']}). The scope-side ADC settling wait is "
+                       f"unchanged, so this run is ~1.6 fps slower. The offset "
+                       f"is firmware-specific and probably moved.")
+                adbutil.log(msg)
+                print(msg, file=sys.stderr, flush=True)
+        if not r.get("ok"):
+            adbutil.log(f"WARNING: patching failed: {r.get('error')}")
+
+
+    logd = {"off": False}
+    if args.quiet_logd:
+        try:
+            # Adb.shell returns a CompletedProcess, not a string.
+            was = adb.shell("getprop init.svc.logd").stdout.strip()
+            if was == "running":
+                adb.shell("stop logd")
+                logd["off"] = True
+                adbutil.log("logd stopped for the session (~0.6 core); "
+                            "restored on exit")
+            else:
+                adbutil.log(f"logd is {was or 'not running'}; leaving it alone")
+        except Exception as e:
+            adbutil.log(f"WARNING: could not stop logd ({e}); continuing")
 
     t0 = time.perf_counter()
     tlast = t0
@@ -305,7 +398,12 @@ def main():
                        f"trig={dv['trig_ms']:.0f}ms "
                        f"empty={int(dv['empty'])} decl={int(dv['declared'])} "
                        f"armTO={int(dv['arm_timeouts'])} "
-                       f"missedBusy={int(dv.get('missed_busy', 0))}"
+                       f"missedBusy={int(dv.get('missed_busy', 0))} "
+                       f"chunks={int(st.get('chunks_in', 0))} "
+                       f"partial={int(st.get('partial', 0))} "
+                       f"incomplete={int(dv.get('incomplete', 0))} "
+                       f"settle={dv.get('settle_ms', 0):.0f}ms "
+                       f"recov={int(dv.get('recoveries', 0))}"
                        + (f"  peak arm {peak['arm']:.0f} ms / trig "
                           f"{peak['trig']:.0f} ms, {peak['slow']} slow cycles"
                           if poll else ""))
@@ -335,15 +433,44 @@ def main():
             except Exception as e:
                 adbutil.log(f"WARNING: could not restore the SCPI sleep ({e}); "
                        f"it comes back when the app restarts")
+        if patched:
+            try:
+                n = tap.exports_sync.restore_sleep_consts().get("restored", 0)
+                adbutil.log(f"usleep constants restored ({n} sites)")
+            except Exception as e:
+                adbutil.log(f"WARNING: could not restore usleep constants ({e}); "
+                            f"they come back when the app restarts")
+        if logd["off"]:
+            try:
+                adb.shell("start logd")
+                adbutil.log("logd restarted")
+            except Exception as e:
+                adbutil.log(f"WARNING: could not restart logd ({e}) -- the "
+                            f"scope is logging nothing until you run "
+                            f"'adb shell start logd' or reboot it")
+        # These three used to be silent, which made a teardown that was being
+        # SIGKILLed at the parent's 15 s cap look identical to one that
+        # finished: the tell was a leaked frida agent (session.detach never
+        # ran) and a libmhotap still mapped.  Log each step so the log says
+        # how far it got.
+        t_td = time.perf_counter()
         try:
             tap.exports_sync.stop()
-        except Exception:
-            pass
+            adbutil.log(f"on-scope tap stopped ({time.perf_counter()-t_td:.1f}s)")
+        except Exception as e:
+            adbutil.log(f"WARNING: on-scope tap did not stop cleanly ({e})")
         try:
             sc.write(":RUN"); sc.close()
-        except Exception:
-            pass
-        session.detach()
+            adbutil.log(f"scope returned to RUN ({time.perf_counter()-t_td:.1f}s)")
+        except Exception as e:
+            adbutil.log(f"WARNING: could not put the scope back in RUN ({e})")
+        try:
+            session.detach()
+            adbutil.log(f"frida session detached ({time.perf_counter()-t_td:.1f}s) "
+                        f"-- teardown complete")
+        except Exception as e:
+            adbutil.log(f"WARNING: frida detach failed ({e}); the agent stays "
+                        f"mapped in the app until it restarts")
 
 
 if __name__ == "__main__":
