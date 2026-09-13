@@ -7,11 +7,15 @@ wrong.
 ## Running it
 
 ```bash
-./run_fft.sh                          # synthetic — no scope needed
-./run_fft.sh --headless --seconds 3   # no window; prints frame timing
-./run_fft.sh --run-seconds 4 --screenshot /tmp/x.png    # smoke test
-./run_fft.sh tap <scope-ip>           # live, fastest path
+./run_fft.sh synthetic                          # no scope needed
+./run_fft.sh synthetic --headless --seconds 3   # no window; prints frame timing
+./run_fft.sh synthetic --run-seconds 4 --screenshot /tmp/x.png    # smoke test
+./run_fft.sh tap <scope-ip>                     # live, fastest path
 ```
+
+Name the source. A bare `./run_fft.sh`, or one with options but no source,
+goes through `--choose`: a dialog, or with `--headless` the remembered
+settings, which may well be the scope.
 
 The venv at `.venv/` is the one `run_fft.sh` uses. **The synthetic source
 exercises the whole display path**, so nearly all UI work can be built and
@@ -22,11 +26,11 @@ verified with no scope attached — use it.
 `docs/SPECTRUM_ANALYSER_FEATURES.md` is the plan: 199 features from real
 analysers (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, SDR tools),
 each scored Status / Effort / Value against this code, then a five-phase order.
-Currently 55 Done, 14 Partial, 115 Missing, 15 N/A on this hardware.
+Currently 54 Done, 18 Partial, 112 Missing, 15 N/A on this hardware.
 
-**Phase 1 is done.** Phase 2 (multiple traces, absolute units via the tap
-preamble, the measurement suite) is next; the trace-mode restructure below is
-its first real obstacle.
+**Phase 1 is done** except the blind-time readout, which is not built. Phase 2
+(multiple traces, finishing absolute units, the measurement suite) is next; the
+trace-mode restructure below is its first real obstacle.
 
 ## Traps
 
@@ -37,12 +41,13 @@ its first real obstacle.
   (measured: rect 1.00, hann 1.50, Blackman-Harris 2.00, flat-top 3.77). Both
   are shown in the annotation block, labelled differently on purpose —
   Keysight and Siglent both document conflating them as a classic error.
-* **Absolute units are blocked in the tap, not the GUI.** `device/libmhotap.c`
-  memsets its header and writes only magic, seq, sample count, bytes-per-sample
-  and sample rate. No `yincrement`/`yorigin`/`yreference`, so the stream carries
-  no vertical scale and the display can only be dBFS. `device/rigol_mho.py`
-  (SCPI) does have them. dBm/dBV over the tap needs a header change plus a
-  rebuilt `.so` pushed to the scope — treat it as a device-layer task.
+* **Absolute units come from a scale queried once, at tap startup.**
+  `device/tap_stream.py` reads `:WAV:YINC?`/`YOR?`/`YREF?` over SCPI before
+  streaming and hands them to `mhotap_set_yscale()`; `libmhotap.c` writes them
+  at header offsets 40/48/56. Zero means unknown, and `analysis.unit_offset_db`
+  then leaves dBV/dBm reading as dBFS. So the scale goes stale if V/div changes
+  mid-session, and the `scpi` source (`ScpiSource`) never fills `yinc` at all —
+  it is dBFS-only. dBm assumes 50 Ω.
 * **Above 1 Mpt the record arrives in 1 Mpt chunks, and the read has to wait.**
   `CApiWave::toWord` is called once per chunk (10 calls at 10 M), and a
   `:WAV:DATA?` sent the instant the capture goes idle gets one chunk — then
@@ -104,11 +109,15 @@ Two performance traps live in that loop:
 `libmhotap.so` via Frida and starts it streaming; `adb.py` is the plumbing
 underneath (connect, root, provision frida-server, find the app pid).
 
-The tap makes two temporary changes to the running scope app, both restored on
-exit and both on by default because they are worth 11.3 → 13.9 fps: it pauses
-the scope's own waveform redraw (that plot thread is ~60% of a core) and
-shortens the app's hardcoded 20 ms per-SCPI-command sleep to 1 ms. See
-`--no-tap-quiet-ui` and `--tap-keep-scpi-sleep`.
+The tap can make four temporary changes to the running scope, all restored on
+exit. Three are on by default: it pauses the scope's own waveform redraw (that
+plot thread holds an A72 at ~99%) and shortens the app's hardcoded 20 ms
+per-SCPI-command sleep to 1 ms — together worth 11.3 → 13.9 fps — and it stops
+logd. The fourth, cutting the ADC settling wait in the arm path from 20 ms to
+10 ms (`ADC_SETTLE_SPEC` in `fft_gui.py`, ~2 fps), is **temporarily off by
+default** (`set_defaults(tap_adc_sleep=False)`) while it was suspected of the
+stalls. See `--no-tap-quiet-ui`, `--tap-keep-scpi-sleep`, `--tap-keep-logd` and
+`--tap-keep-adc-sleep`, and the `run_fft.sh` header for the measured gains.
 
 Rebuilding the tap needs the NDK: `ANDROID_NDK=... device/build_tap.sh`.
 

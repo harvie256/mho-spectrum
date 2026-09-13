@@ -161,8 +161,13 @@ fresh session          40 / 20 ms         broken from the first cycle
 
 So the failure latches, and getting out of it needs about 200 ms where staying out
 needs 20. The driver now starts each session at 200 ms, drops to 40 ms after three
-whole records, and goes back to 200 on any broken one (`settle_adapt`). The per-Mpt
-scaling it applies at other depths is an assumption; only 10 M was measured.
+whole records, and goes back to 200 on any broken one (`settle_adapt` in
+`device/libmhotap.c`). A broken record at the low value also doubles it (capped at the
+high one), and five broken in a row at the high value double that, up to 2 s
+(`SETTLE_*`); `mhotap_drive_settle()` pins a fixed delay instead. The per-Mpt
+scaling it applies at other depths (`SETTLE_HI_US_PER_MPT` 20 ms, `SETTLE_LO_US_PER_MPT`
+4 ms) is an assumption; only 10 M was measured. The reply-header wait scales the same
+way: `REPLY_HDR_MS` 120 plus `REPLY_MS_PER_MPT` 30 per Mpt beyond the first.
 
 **What it looked like before.** Each chunk went out as a frame labelled with the
 record's rate, and the one chunk a broken cycle produced had been read before the
@@ -173,7 +178,23 @@ app finished filling it: ~333k real samples, then ~667k of a 10x decimated trace
 **After.** 10 M: 1.81 fps, 36.2 MB/s, every frame 10,000,000 points, 0 partial, 0
 incomplete, the 1 MHz tone in place. 54 of 81 records were dropped on the scope
 because the link is the limit at 20 MB a record. 1 M: 13.8 fps, unchanged (it is a
-single call and skips the delay).
+single call and skips the settle hysteresis; its ~24 ms capture also clears the
+short-capture floor below, so it pays no delay at all).
+
+### Fast timebases: a read too soon after a short capture stalls 2 s
+
+A one-call record wants a delay too, for a different reason. At 100 us/div the capture
+is idle ~1 ms after arming, and a `:WAV:DATA?` sent then often reaches the app before it
+has taken the record in. The app holds the query ~2 s waiting for a waveform a stopped
+SINGLE never produces, each re-arm queues another behind it, and the backlog drains as
+empty blocks: a 2.0-2.1 s stall. It follows capture time, not depth (1 k, 10 k and 1 M
+all stalled at 100 us/div). Measured 2026-09-13 at 100 us/div, 10 k, 25 s each, delay
+after idle vs stalls over 1 s: 0 ms 8, 2 ms 6, 5 ms 8, 10 ms 1, 20 ms 0.
+
+So for one-call records (and no pinned settle) `driver_main` waits until
+`SHORT_CAPTURE_US` (20 ms) after the arm before reading; a capture already that long
+pays nothing. Built in: 0 stalls, 4-5 -> 17 fps at 100 us/div, 10 k. The driver's
+`settle_ms` stat reports the delay actually applied, short captures included.
 
 ### Sleep cadence
 
@@ -282,8 +303,8 @@ logcat -b all    -f /data/logs/tools_log/logcat_1.txt -r 1024 -n 4
 
 **It is the ingestion that costs, not the readers** — killing both file drains recovered
 only 0.10 of a core, while stopping `logd` recovered all 0.62. So the fix is `stop logd`,
-and it is now the tap's third temporary change (`--quiet-logd`, on by default via
-`run_fft.sh`, disabled with `--tap-keep-logd`), restarted on exit alongside the redraw
+and it is now the tap's third temporary change (`--quiet-logd` in `tap_stream.py`, on by
+default from `fft_gui.py`/`run_fft.sh`, disabled with `--tap-keep-logd`), restarted on exit alongside the redraw
 and the SCPI sleep. Nothing is logged on the scope while it streams. If the tap is killed
 hard, `logd` stays stopped until `adb shell start logd` or a reboot.
 
@@ -333,7 +354,7 @@ or one of `/rigol/tools/{tcpsvd,ftpd}`.
 ## Traps that cost real time
 
 * **`--run-seconds` is not the headless duration.** `fft_gui.py` headless uses
-  `args.seconds` (**default 10.0**); `--run-seconds` is the windowed smoke test. So
+  `args.seconds` (**default 0, treated as 10 s**); `--run-seconds` is the windowed smoke test. So
   `--headless --run-seconds 150` streams for ~7 s and silently ignores the flag. Several
   measurements here were originally taken *outside* the streaming burst because of this,
   and produced the confident and completely wrong conclusion that streaming adds no CPU.
@@ -368,8 +389,9 @@ or one of `/rigol/tools/{tcpsvd,ftpd}`.
 
 ## Stale numbers elsewhere in this repo
 
-`CLAUDE.md` and `run_fft.sh`'s help both describe the scope's plot thread as "~60% of a
-core". Measured 2026-09-08 it is **98.7–100% of an A72** at idle. The tap's 11.3 → 13.9 fps
+`CLAUDE.md` and `tap_stream.py`'s `--quiet-ui` help describe the scope's plot thread as
+"~60% of a core" (`run_fft.sh`'s help has since been corrected to ~99%). Measured
+2026-09-08 it is **98.7–100% of an A72** at idle. The tap's 11.3 → 13.9 fps
 figure still holds (11.4–13.3 fps measured over long runs).
 
 ## Tried and removed: 12-bit packing, and A53 pinning
@@ -400,8 +422,8 @@ pay, and a flag that only buys consistency was not worth the surface.
 
 ## The acquisition cycle: where the frame time goes
 
-From the tap's own instrumentation (the `--tap-poll-ms`/`--tap-drive-csv` flags,
-since removed), 761 cycles,
+From the tap's own instrumentation (`tap_stream.py --drive-poll-ms`/`--drive-csv`; the
+`fft_gui.py` equivalents have since been removed), 761 cycles,
 medians. Note `arm_ms` as logged is `t2 - t0` and *includes* the busy wait, so the
 `set_state` call alone is `arm - wait_busy - busy`, computed per cycle:
 
@@ -429,9 +451,12 @@ return address, three sleeps fire exactly once per acquisition:
 ### What is worth changing: only the ADC one, and only halfway
 
 Each constant is a plain `mov w<rd>, #imm` a couple of instructions before the `bl`,
-so it can be rewritten in place (this is what the tap now does for the ADC site
-by default; the general `--tap-sleep-const` flag has been removed, restored on exit,
-refused unless the instruction really is a movz with the expected immediate).
+so it can be rewritten in place — restored on exit, and refused unless the instruction
+really is a movz/movk with the expected immediate (`patchSleepConsts` in `mho_tap.js`;
+`tap_stream.py --sleep-const OFF:EXPECT_US:NEW_US`). `fft_gui.py` applies the ADC site
+as `ADC_SETTLE_SPEC` (`0x3417fc:20000:10000`), undone with `--tap-keep-adc-sleep`; as of
+2026-09-13 its default is **temporarily off** while checking whether it is behind the
+occasional stalls.
 
 | | fps | |
 |---|---|---|

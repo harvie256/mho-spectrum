@@ -22,8 +22,8 @@
 #                                                          --tap-keep-scpi-sleep
 #   * logd is stopped: the scope's own logging is the largest non-app CPU
 #     consumer while streaming, worth 0.62 of a core           --tap-keep-logd
-#   * the ADC settling wait in the arm path is cut 20 ms -> 10 ms
-#                                                        --tap-keep-adc-sleep
+#   * the ADC settling wait in the arm path is cut 20 ms -> 10 ms -- currently
+#     OFF by default (fft_gui.py) while suspected of stalls --tap-keep-adc-sleep
 # The first two are worth 11.3 -> 13.9 fps and remove the stalls; logd took
 # the box from 88.8% to 81.7% busy, and the ADC wait ~12.9 -> ~14.8 fps
 # (measured 2026-09-13).  Nothing is logged on the scope while it streams.
@@ -63,7 +63,7 @@ export PYQTGRAPH_QT_LIB
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 py="$root/.venv/bin/python"
 
-usage() { sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
@@ -127,7 +127,7 @@ case "${1:-choose}" in
         args=(--choose)
         ;;
     *)
-        echo "error: unknown source '${1}' (want: synthetic, scpi, stream)" >&2
+        echo "error: unknown source '${1}' (want: synthetic, scpi, stream, tap)" >&2
         exit 2
         ;;
 esac

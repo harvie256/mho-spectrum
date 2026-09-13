@@ -17,7 +17,8 @@ patch itself and the reverse-engineering behind it; see
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-./run_fft.sh                       # synthetic signal, no scope needed
+./run_fft.sh                       # pick source + IP in a dialog (remembered)
+./run_fft.sh synthetic             # synthetic signal, no scope needed
 ./run_fft.sh tap                   # live off the scope, asks for the IP
 ./run_fft.sh tap 192.168.23.20     # ... or give it, and it is remembered
 ./run_fft.sh scpi 192.168.23.20    # live over plain SCPI, slower
@@ -58,20 +59,23 @@ captures a frame and exits, which is how the smoke tests work.
 
 `docs/SPECTRUM_ANALYSER_FEATURES.md` surveys what real spectrum analysers do
 (Rigol RSA, Keysight X-series, R&S, Tektronix RTSA, and the SDR tools) and
-scores all 199 features against this codebase: **55 Done, 14 Partial, 115
+scores all 199 features against this codebase: **54 Done, 18 Partial, 112
 Missing, 15 N/A on this hardware.** It ends with a five-phase build order.
 
-**Phase 1 — make the existing display honest and measurable — is done.** It
-turned an FFT viewer into something whose numbers can be quoted: ENBW-correct
-RBW alongside the bin spacing, seven bin-to-pixel detectors, reference level
-and dB/div with auto-scale, centre/span and start/stop entry, markers with
-deltas and peak stepping, a peak table, full-resolution CSV export, clipping
-and blind-time annunciation, and ADC-spur marks at k·fs/16. All of it is
-exercised by the synthetic source — no scope required.
+**Phase 1 — make the existing display honest and measurable — is done,** bar
+the blind-time (duty-cycle) readout, which is not built yet. It turned an FFT
+viewer into something whose numbers can be quoted: ENBW-correct RBW alongside
+the bin spacing, seven bin-to-pixel detectors, reference level and dB/div with
+auto-scale, centre/span and start/stop entry, markers with deltas and peak
+stepping, a peak table, full-resolution CSV export, clipping annunciation, and
+ADC-spur marks at k·fs/16. All of it is exercised by the synthetic source — no
+scope required.
 
 **Phase 2 — traces, measurements and absolute units** is next: independent
-traces with the Active/View/Blank model, the measurement suite (channel power,
-OBW, THD, SFDR, SINAD/ENOB), and the scope preamble plumbed through the tap.
+traces with the Active/View/Blank model and the measurement suite (channel
+power, OBW, THD, SFDR, SINAD/ENOB). Absolute units are partly there: the tap
+already carries the vertical scale and dBV/dBm (50 Ω) are offered, but the
+scale is read once at startup and the SCPI source has none.
 
 Two findings worth knowing before you touch the code:
 
@@ -80,11 +84,12 @@ Two findings worth knowing before you touch the code:
   (hann 1.50, Blackman-Harris 2.00, flat-top 3.77, computed from the window
   itself rather than tabulated). Both are on screen, labelled differently.
   Anything claiming dBm/Hz, a noise marker or channel power must use the RBW.
-* **Absolute amplitude units are blocked at the transport, not the display.**
-  `device/libmhotap.c` zeroes its record header and writes only magic, sequence,
-  sample count, bytes-per-sample and sample rate — no `yincrement`/`yorigin`/
-  `yreference`. The SCPI path (`device/rigol_mho.py`) has them. So dBm/dBV over
-  the tap needs a header change and a rebuilt `libmhotap.so`, not just GUI work.
+* **Absolute amplitude units depend on a scale sent once, at startup.**
+  `device/tap_stream.py` queries `yincrement`/`yorigin`/`yreference` over SCPI
+  before streaming and `device/libmhotap.c` carries them in every record header.
+  That lets the AMPT units box offer dBV and dBm (the latter assumes 50 Ω). The
+  scale is not refreshed if V/div changes mid-session, and the plain `scpi`
+  source does not pass it through, so it is dBFS-only.
 
 ## What this hardware can and cannot do
 
